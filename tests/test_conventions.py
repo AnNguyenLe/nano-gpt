@@ -8,8 +8,10 @@ them:
   2. references float32 / float16 (as an attribute like `np.float32`, a
      bare name, or a string such as `"float32"`);
   3. imports torch, jax, tensorflow or autograd;
-  4. contains a `TODO(SPRINT1-...)` marker (a temporary fallback per
-     SPRINT_1_PLAN.md §10 that must be removed before Sprint 1 ships).
+  4. contains a `TODO(SPRINT<n>-...)` marker for any sprint (a temporary
+     fallback per SPRINT_1_PLAN.md §10 / SPRINT_2_PLAN.md §9 that must be
+     removed before that sprint ships). Widened from `TODO(SPRINT1-` to
+     `TODO(SPRINT` at Sprint 2 integration (SPRINT_2_PLAN.md §10 item 1).
 
 This is a textual/structural guard over the other engineers' source, not a
 semantic one: it enforces the *shape* of the Frozen Conventions contract
@@ -29,7 +31,7 @@ FORBIDDEN_FLOATS = {1e-5, 1e-8, 1e-6, 1e-10, 0.02, 0.044715}
 ALLOWED_FLOATS = {0.0, 0.5, 1.0, 2.0, 3.0}  # documented as always fine (GELU/LN algebra, eps=0)
 FORBIDDEN_DTYPE_NAMES = {"float32", "float16"}
 FORBIDDEN_IMPORT_ROOTS = {"torch", "jax", "tensorflow", "autograd"}
-TODO_MARKER = "TODO(SPRINT1-"
+TODO_MARKER = "TODO(SPRINT"
 
 
 def _scanned_files():
@@ -160,7 +162,17 @@ def test_guard_catches_todo_marker(tmp_path):
     bad = tmp_path / "bad.py"
     bad.write_text("# TODO(SPRINT1-CONFIG): delete this block\nEPS = 0.0\n", encoding="utf-8")
     violations = _check_file(bad)
-    assert any("TODO(SPRINT1-" in v for v in violations)
+    assert any("TODO(SPRINT" in v for v in violations)
+
+
+@pytest.mark.parametrize("marker", ["TODO(SPRINT2-ATTN)", "TODO(SPRINT3-MODEL)"])
+def test_guard_catches_later_sprint_todo_markers(tmp_path, marker):
+    # Sprint 2 widening: a shim marker from any sprint, not just Sprint 1,
+    # must make the guard fail.
+    bad = tmp_path / "bad.py"
+    bad.write_text(f"# {marker}: delete this shim\nx = 0.0\n", encoding="utf-8")
+    violations = _check_file(bad)
+    assert any("bad.py:1:" in v and "TODO(SPRINT" in v for v in violations), violations
 
 
 def test_guard_clean_file_has_no_violations(tmp_path):
