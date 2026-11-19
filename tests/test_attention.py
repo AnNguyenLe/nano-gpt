@@ -317,3 +317,219 @@ def test_tl9_kb_structural_zero_protocol(monkeypatch):
 
     # Still report rel_err and max_elem_rel_err for k.b, per the PO condition.
     print(f"attn.k.b: rel_err={kb.rel_err:.3e} max_elem_rel_err={kb.max_elem_rel_err:.3e}")
+
+
+# ---------------------------------------------------------------------------
+# Backward vs. oracle (P1): gradcheck with an adapter forward that returns
+# the oracle's output plus the vectorized cache. Milestone B4.
+# ---------------------------------------------------------------------------
+def test_backward_vs_oracle_adapter_gradcheck():
+    attn, params, x = _tiny_gradcheck_fixture()
+
+    def fwd(z, p):
+        _, c = attn.forward(z, p)
+        return reference_attention_forward(z, p, attn.H), c
+
+    report = gradcheck(fwd, attn.backward, params, x)
+    print(report)
+    for name, t in report.tensors.items():
+        if name == "attn.k.b":
+            continue
+        assert t.rel_err < GRADCHECK_TOL, (name, t)
+    assert report.tensors["attn.k.b"].max_abs_err <= REL_ERR_FLOOR
+
+
+# ---------------------------------------------------------------------------
+# Test-the-tests (local broken variants; monkeypatch the module helpers).
+# ---------------------------------------------------------------------------
+def test_tt_interleaved_head_split_passes_gradcheck_but_fails_oracle(monkeypatch):
+    """F7: an interleaved split/merge pair is internally self-consistent (so
+    gradcheck is blind to it) but disagrees with the independent oracle."""
+
+    def _interleaved_split(a, H):
+        B, T, d = a.shape
+        hd = d // H
+        return a.reshape(B, T, hd, H).transpose(0, 3, 1, 2)
+
+    def _interleaved_merge(y):
+        B, H, T, hd = y.shape
+        return y.transpose(0, 2, 3, 1).reshape(B, T, H * hd)
+
+    monkeypatch.setattr(attention, "_split_heads", _interleaved_split)
+    monkeypatch.setattr(attention, "_merge_heads", _interleaved_merge)
+
+    attn, params, x = _tiny_gradcheck_fixture()
+    report = gradcheck(attn.forward, attn.backward, params, x)
+    print("interleaved split gradcheck:", report)
+    for name, t in report.tensors.items():
+        if name == "attn.k.b":
+            continue
+        assert t.rel_err < GRADCHECK_TOL, (name, t)  # gradcheck is blind to this bug
+
+    out, _ = attn.forward(x, params)
+    ref = reference_attention_forward(x, params, attn.H)
+    max_abs = float(np.max(np.abs(out - ref)))
+    print("interleaved split oracle mismatch max_abs=", max_abs)
+    assert max_abs > 1e-3  # the oracle catches it; prototype measured 0.61
+
+
+def test_tt_no_transpose_split_fails_oracle(monkeypatch):
+    def _no_transpose_split(a, H):
+        B, T, d = a.shape
+        hd = d // H
+        return a.reshape(B, H, T, hd)
+
+    def _no_transpose_merge(y):
+        B, H, T, hd = y.shape
+        return y.reshape(B, T, H * hd)
+
+    monkeypatch.setattr(attention, "_split_heads", _no_transpose_split)
+    monkeypatch.setattr(attention, "_merge_heads", _no_transpose_merge)
+
+    attn, params, x = _tiny_gradcheck_fixture()
+    out, _ = attn.forward(x, params)
+    ref = reference_attention_forward(x, params, attn.H)
+    max_abs = float(np.max(np.abs(out - ref)))
+    print("no-transpose split oracle mismatch max_abs=", max_abs)
+    assert max_abs > 1e-3  # prototype measured 1.6
+
+
+def test_tt_dropped_fanout_fails_x_gradcheck():
+    attn, params, x = _tiny_gradcheck_fixture()
+
+    def _broken_backward(d_out, cache):
+        cq, ck, cv, co = cache["cq"], cache["ck"], cache["cv"], cache["co"]
+        qh, kh, vh = cache["qh"], cache["kh"], cache["vh"]
+        P, allowed = cache["P"], cache["allowed"]
+
+        dY, g_o = attn.o.backward(d_out, co)
+        dYh = attention._split_heads(dY, attn.H)
+        dP = dYh @ vh.swapaxes(-1, -2)
+        dvh = P.swapaxes(-1, -2) @ dYh
+        dZ, _ = attention.ops.softmax_backward(dP, {"p": P})
+        dS = np.where(allowed, dZ, 0.0)
+        dqh = attn.scale * (dS @ kh)
+        dkh = attn.scale * (dS.swapaxes(-1, -2) @ qh)
+
+        dx_q, g_q = attn.q.backward(attention._merge_heads(dqh), cq)
+        dx_k, g_k = attn.k.backward(attention._merge_heads(dkh), ck)
+        dx_v, g_v = attn.v.backward(attention._merge_heads(dvh), cv)
+
+        d_x = dx_v  # BUG: dropped fan-out -- should be dx_q + dx_k + dx_v
+        d_params = {**g_q, **g_k, **g_v, **g_o}
+        return d_x, d_params
+
+    report = gradcheck(attn.forward, _broken_backward, params, x)
+    print("dropped fan-out gradcheck:", report)
+    assert report.tensors["x"].rel_err >= GRADCHECK_TOL
+
+
+def test_tt_missing_scale_in_backward_fails_qW_and_kW():
+    attn, params, x = _tiny_gradcheck_fixture()
+
+    def _broken_backward(d_out, cache):
+        cq, ck, cv, co = cache["cq"], cache["ck"], cache["cv"], cache["co"]
+        qh, kh, vh = cache["qh"], cache["kh"], cache["vh"]
+        P, allowed = cache["P"], cache["allowed"]
+
+        dY, g_o = attn.o.backward(d_out, co)
+        dYh = attention._split_heads(dY, attn.H)
+        dP = dYh @ vh.swapaxes(-1, -2)
+        dvh = P.swapaxes(-1, -2) @ dYh
+        dZ, _ = attention.ops.softmax_backward(dP, {"p": P})
+        dS = np.where(allowed, dZ, 0.0)
+        dqh = dS @ kh  # BUG: missing self.scale
+        dkh = dS.swapaxes(-1, -2) @ qh  # BUG: missing self.scale
+
+        dx_q, g_q = attn.q.backward(attention._merge_heads(dqh), cq)
+        dx_k, g_k = attn.k.backward(attention._merge_heads(dkh), ck)
+        dx_v, g_v = attn.v.backward(attention._merge_heads(dvh), cv)
+
+        d_x = dx_q + dx_k + dx_v
+        d_params = {**g_q, **g_k, **g_v, **g_o}
+        return d_x, d_params
+
+    report = gradcheck(attn.forward, _broken_backward, params, x)
+    print("missing-scale gradcheck:", report)
+    assert report.tensors["attn.q.W"].rel_err >= GRADCHECK_TOL
+    assert report.tensors["attn.k.W"].rel_err >= GRADCHECK_TOL
+
+
+# ---------------------------------------------------------------------------
+# Robustness
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("T", [1, 2, 4, 7])
+def test_robustness_finite_at_various_T(T):
+    rng = make_rng(_FIXTURE_SEED + 300 + T)
+    d, H, B = 8, 2, 2
+    attn = CausalSelfAttention("attn", d, H)
+    params = _non_init_params(rng, d)
+    x = rng.standard_normal((B, T, d)).astype(np.float64)
+
+    out, cache = attn.forward(x, params)
+    assert np.all(np.isfinite(out))
+
+    d_out = rng.standard_normal(out.shape).astype(np.float64)
+    d_x, d_params = attn.backward(d_out, cache)
+    assert np.all(np.isfinite(d_x))
+    for v in d_params.values():
+        assert np.all(np.isfinite(v))
+
+
+def test_no_mutation_of_params_x_and_d_out():
+    attn, params, x = _tiny_gradcheck_fixture()
+    params_before = {k: v.copy() for k, v in params.items()}
+    x_before = x.copy()
+
+    out, cache = attn.forward(x, params)
+    for k in params:
+        assert np.array_equal(params[k], params_before[k])
+    assert np.array_equal(x, x_before)
+
+    rng = make_rng(_FIXTURE_SEED + 400)
+    d_out = rng.standard_normal(out.shape).astype(np.float64)
+    d_out_before = d_out.copy()
+    attn.backward(d_out, cache)
+    assert np.array_equal(d_out, d_out_before)
+    for k in params:
+        assert np.array_equal(params[k], params_before[k])
+    assert np.array_equal(x, x_before)
+
+
+def test_dtype_strictness_float32_x_raises():
+    attn, params, x = _tiny_gradcheck_fixture()
+    with pytest.raises(TypeError):
+        attn.forward(x.astype(np.float32), params)
+
+
+def test_dtype_strictness_float32_param_raises():
+    attn, params, x = _tiny_gradcheck_fixture()
+    bad_params = dict(params)
+    bad_params["attn.q.W"] = bad_params["attn.q.W"].astype(np.float32)
+    with pytest.raises(TypeError):
+        attn.forward(x, bad_params)
+
+
+def test_dtype_strictness_float32_d_out_raises():
+    attn, params, x = _tiny_gradcheck_fixture()
+    out, cache = attn.forward(x, params)
+    with pytest.raises(TypeError):
+        attn.backward(out.astype(np.float32), cache)
+
+
+def test_value_error_wrong_ndim():
+    attn = CausalSelfAttention("attn", 8, 2)
+    rng = make_rng(_FIXTURE_SEED + 500)
+    params = attn.init_params(rng)
+    x_2d = rng.standard_normal((4, 8)).astype(np.float64)
+    with pytest.raises(ValueError):
+        attn.forward(x_2d, params)
+
+
+def test_value_error_wrong_last_dim():
+    attn = CausalSelfAttention("attn", 8, 2)
+    rng = make_rng(_FIXTURE_SEED + 501)
+    params = attn.init_params(rng)
+    x_wrong_d = rng.standard_normal((2, 4, 7)).astype(np.float64)
+    with pytest.raises(ValueError):
+        attn.forward(x_wrong_d, params)
