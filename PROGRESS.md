@@ -433,3 +433,211 @@ x + attn(LN(x)), x + mlp(LN(x))) and `model.py` (token + positional embeddings, 
 blocks, final LN, tied lm_head). Also `param_count.py` (C1), the full-model gradcheck
 in `tests/test_gradients.py` (C6, with TL-9 for every b_k), C7 weight tying, and the
 **C5 re-run on the full model**.
+
+---
+
+## Phase 3 — Transformer Block & Full Model Assembly  [DONE 2026-11-20]
+
+**Process:** same rules as Sprint 2 (per-role env-var identities, explicit pathspecs,
+no history rewrites), plus the new P0 commit-discipline gate (SPRINT_3_PLAN.md §8.2 /
+TL-22): every commit must be green against the *committed* tree plus the author's own
+staged files. Sprint 1+2 history is unchanged (`65ca41e` is an ancestor of HEAD).
+
+**Owners / commits (each checked with `git show --stat`; each touches only its owner's files):**
+
+| Role | Commits | Files |
+|---|---|---|
+| Engineer A | `88fc79b` [A1] MLP + gradcheck + closed-form anchor; `b0fa874` [A2] C1 param count; `03f8ab7` [A3] C2 loss at init | `nanogpt/mlp.py`, `tests/test_mlp.py`, `nanogpt/param_count.py`, `tests/test_param_count.py`, `tests/test_loss_at_init.py` |
+| Engineer B | `f6d8fe2` [B1] pre-LN block; `83b05d1` [B2] GPT forward + tied head (structure final); `74a22b8` [B3] GPT backward + C7 flags + dev gradcheck | `nanogpt/block.py`, `tests/test_block.py`, `nanogpt/model.py`, `tests/test_model.py` |
+| Engineer C | `93f9577` [C1] full-model C5 re-run; `180749c` [C2] C6 full-model gradcheck + TL-9 per layer; `f036139` [C3] C7 weight tying | `tests/test_causal_mask.py` (append-only; the Sprint 2 portion is byte-identical), `tests/test_gradients.py`, `tests/test_weight_tying.py` |
+| Tech Lead | `f5d6464` kickoff plan; Sprint 3 sign-off commit (this entry) | `SPRINT_3_PLAN.md`, `PROGRESS.md` |
+
+Commit order: `A1 < B1 < B2 < {A2, C1} < B3 < {A3, C2, C3}`. This satisfies §9:
+`[A1]<[B1]<[B2]<{[A2],[A3],[C1],[B3]}`, `[B3]<[C2]` and `[B3]<[C3]`. Each commit is one
+milestone. No commit batches milestones together.
+
+### Per-commit isolation check (P0 gate; TL re-run, `git archive <c>` into a fresh scratch dir, full suite)
+
+| Commit | Result |
+|---|---|
+| `88fc79b` [A1] | 273 passed |
+| `f6d8fe2` [B1] | 288 passed |
+| `83b05d1` [B2] | 306 passed |
+| `b0fa874` [A2] | 325 passed |
+| `93f9577` [C1] | 332 passed |
+| `74a22b8` [B3] | 335 passed |
+| `03f8ab7` [A3] | 342 passed |
+| `180749c` [C2] | 354 passed |
+| `f036139` [C3] | 363 passed |
+
+**Every interior commit is green.** Sprint 2's D1 (batched milestones committed against
+uncommitted dependencies) was **not repeated**. The counts match the numbers each
+engineer reported from their own scratch-tree runs. **Every Sprint 3 commit is a valid
+bisect point.**
+
+Local stand-ins (allowed under §6, reported by the engineers): B validated `block.py`
+against a scratchpad MLP stand-in before [A1] landed, then re-ran against the real
+`mlp.py` before committing. C drafted all three test files against scratchpad
+MLP/Block/GPT stand-ins, then re-validated them against the real committed B2/B3
+before committing. No stand-in was ever added to the repo. A used none: it waited for
+[B2] and committed only model-independent work before that.
+
+### Real test status (TL run on HEAD `f036139`)
+
+`.venv/Scripts/python.exe -m pytest tests/ -q -p no:cacheprovider` gives **363 passed
+in about 23 s**, within the 60 s budget. Every file is under the 10 s per-file budget:
+
+| File | Tests | Time |
+|---|---|---|
+| test_mlp.py (A) | 16 | 4.6 s (the d=64 spot check accounts for most of it) |
+| test_param_count.py (A) | 18 | 0.2 s |
+| test_loss_at_init.py (A) | 7 | 1.2 s |
+| test_block.py (B) | 14 | 1.5 s |
+| test_model.py (B) | 20 | 0.6 s |
+| test_causal_mask.py (C, Sprint 2 + appended C5 full model) | 21 | 0.5 s |
+| test_gradients.py (C) | 12 | 6.0 s |
+| test_weight_tying.py (C) | 9 | 3.6 s |
+| Sprint 1+2 files (unchanged) | 246 | each ≤ 0.8 s |
+
+### Sign-off checklist (§11)
+
+- `grep -rn "TODO(SPRINT" nanogpt/` is empty, and the conventions guard is green.
+- No torch, jax, tf or autograd.
+- `shifted_causal_mask` is referenced in `nanogpt/` only by `attention_mask.py`.
+- There is no `lm_head` key in `param_keys()`. `lm_head.W` appears only as an alias in
+  `named_parameters()`, where it is the same object as `wte.W`.
+- `model.py` contains no `["wte.W"] = ...` subscript assignment (C's AST scan also
+  enforces this).
+- The corpus SHA-256 is still `7afc055a…2854` and V = 55.
+- No Phase 4+ files exist (`optim.py`, `flops.py`, `train.py`, `kv_cache.py`,
+  `sampling.py`, `checkpoint.py`, `generate.py`). There is no KV-cache, sampling,
+  `generate()` or `train_step()` in `model.py` or `attention.py`.
+- `git status` is clean.
+
+### C1 — parameter count
+
+- `formula_param_count(50257, 1024, 768, 12) == 124,439,808`. This is GPT-2 small,
+  checked by formula only (R16).
+- Live unique-array count equals the formula exactly: tiny **2,232**, default
+  **107,712**, max **816,768**. The TL re-measured tiny and default independently.
+- One block has 16 tensors totalling 12d² + 13d.
+- Test-the-tests:
+  - A naive sum double-counts the tie (formula + V·d).
+  - A `.T` alias entry is rejected (ValueError).
+  - A phantom head bias breaks the equality.
+  - All 4 precondition monkeypatches raise.
+
+### C2 — loss at init (real corpus windows, B=4, |loss − ln 55|; INIT_LOSS_TOL = 0.1)
+
+| Config | seed +0 | +1 | +2 |
+|---|---|---|---|
+| default (V=55, T=64, d=64, L=2, H=4) | 0.0064 | 0.0331 | 0.0155 |
+| tiny | 0.0038 | 0.0136 | 0.0051 |
+| max | 0.0043 | 0.0103 | 0.0456 |
+
+- Init statistics: biases and β are exactly 0, γ is exactly 1, and every 2-D weight with
+  ≥512 entries has std within ±10% of INIT_STD.
+- Wrong-init test-the-test (std = 1.0): loss 19.75, delta **15.75**, above the >1.0
+  gate. The tolerance was not loosened.
+
+### C6 — full-model gradcheck (tiny d=8/L=2/H=2/T=4, non-init fixture; gated norm-wise rel_err < 1e-6)
+
+- **G1/G2/G3** (logits objective, loss objective, and w.r.t. the float input `h0` per
+  TL-18): every tensor except the exempt set passes. The exempt set is asserted to be
+  exactly `{h.0.attn.k.b, h.1.attn.k.b}`.
+- **B dev gradcheck** (L=1, d=8, V=11): all 20 non-k.b tensors pass. The worst
+  max_elem_rel_err is 4.66e-7 (`h.0.mlp.proj.W`).
+- **Block level** (B): all 16 non-k.b block tensors plus `x` pass, worst 1.19e-10. The
+  residual anchor (zeroed output projections) gives `out == x` exactly.
+- **TL independent re-measurement** (own seed `DEFAULT_SEED+950`, params perturbed by
+  0.3·N(0,1), loss objective, own central-difference loop, 36 tensors): no non-k.b
+  failures. Worst non-k.b rel_err is 1.8e-9 (`h.1.attn.k.W`). For k.b, analytic
+  max|g| ≤ 2.1e-17 and FD max_abs_err ≤ 4.4e-11.
+
+### TL-9 reapplied to every block's `attn.k.b` (PO's ratification condition, TL-19)
+
+| Check | Block level (B) | Full model l=0 (C) | Full model l=1 (C) | Threshold |
+|---|---|---|---|---|
+| (a) analytic max abs db_k | 2.29e-16 | 1.75e-15 | 4.44e-16 | ≤ 1e-12 |
+| (b) FD max_abs_err | 1.78e-10 | 7.1e-10 (logits) / 4.4e-11 (loss) | 7.1e-10 / 1.65e-17 | ≤ 1e-8 |
+| (c) invariance max abs Δout under b_k + 10·N | 1.33e-15 | 5.1e-15 | 2.3e-15 | ≤ 1e-12 |
+| (d) dropped-term adversary max abs db_k | 4.37 | 23.75 | 6.10 | > 1e-3 (discriminates) |
+
+The protocol is applied unchanged at every layer. It is never replaced by the literal
+rel_err gate.
+
+### C7 — weight tying
+
+- Partial-sum identity: max abs (g_in + g_out − g_full) is **0.0**, with ‖g_in‖ = 54.6
+  and ‖g_out‖ = 51.8 (both non-trivial).
+- Independent FD (TL-20; never built from the production split):
+  - rel_err(g_out, FD_out) = 2.85e-11
+  - rel_err(g_full, FD_full) = 2.43e-10
+  - rel_err(g_in, FD_full − FD_out) = 3.10e-10
+- When both flags are False, `wte.W` is exactly zero and every other key is
+  bit-identical.
+- The tied-head anchor `logits == y @ wte.W.T` holds with max_abs 0.0.
+- Test-the-tests:
+  - An overwriting `accumulate_grads` breaks the identity and fails the gradcheck.
+  - A Fortran-order or transposed-view `wte.W` is refused by the contiguity guard.
+  - The production array passes.
+
+### C5 re-run on the full model (embeddings + L blocks + ln_f + tied head; Jacobian of logits w.r.t. h0)
+
+- **Correct mask:** future_max = 0.0 and past_min > 0.1 (non-vacuous). Substituting a
+  token at position s leaves logits[t<s] bit-identical and changes logits[s].
+- **All blocks shifted:** leakage reaches exactly s = t+L (> 0.1) and is zero for
+  s ≥ t+L+1. Token substitution independently confirms the leak.
+- **One block shifted** (each l): leakage reaches exactly s = t+1 and is zero for
+  s ≥ t+2. Identity checks confirm the mask is threaded to each block. A wrong-length
+  `mask_fn` list raises.
+- **C5 is now retired** at both the isolated (Sprint 2) and full-model (Sprint 3)
+  levels.
+
+### Rulings carried
+
+R15 (fc/proj key names), R16 (GPT-2 small formula-only), R17/TL-18 (C6 float input =
+`h0`), R18 (no P2 extras), R19/TL-23 (C1/C2 moved to A), TL-16 (three-layer model API),
+TL-17 (single `wte.W` array, tied head with no bias), TL-19 (TL-9 per layer), TL-20 (C7
+independent FD), TL-21 (`mask_fn` callable-or-list), TL-22 (commit-green gate). All
+earlier rulings (TL-1, TL-9, TL-10, R4–R6, R12–R14) still hold.
+
+### Integration fixes made by the TL
+
+**None needed.** HEAD and every interior commit were green, ownership and order were
+correct, and all §11 checklist items passed. There are no TL fixup commits this sprint.
+
+### Deviations from SPRINT_3_PLAN.md (for PO ratification)
+
+- **None at the rejection level.** The P0 commit-discipline gate passes for all 9
+  engineer commits.
+- **D1 (minor, informational):** A's C2 windows (offset DEFAULT_SEED+303) differ from
+  the TL prototype's windows, because the plan says only "real corpus". The deltas are
+  the same order of magnitude as the TL prototype's.
+- **D2 (minor, informational):** C needed a seed-swept fixture draw so the all-shifted
+  leak clears the 0.1 bar robustly. This is noted inline in the test, and the
+  threshold was not changed.
+- **D3 (process, benign):** A and C both hit a shared-index race (another engineer's
+  staged files were in the index). Both used `git commit -- <own pathspec>` and checked
+  with `git show --stat`. No teammate file was captured.
+
+### Open items / watch items for Sprint 4
+
+- `tests/test_mlp.py` (4.6 s) and `tests/test_gradients.py` (6.0 s) take most of the
+  suite's runtime. Keep the full suite under 60 s as Phase 4 tests are added.
+- Keep the P0 per-commit isolation gate and the per-commit scratch-tree evidence in
+  engineer reports.
+- TL-9 applies wherever attention gradients are checked again (for example, any
+  optimizer-step gradcheck).
+
+**Next: Phase 4 — Optimizer & Training Loop (Sprint 4).** Scope per the execution
+plan:
+- `optim.py`: AdamW with decoupled weight decay and correct bias correction. Decide
+  explicitly which tensors are excluded from decay (biases, LN γ/β, and the tied
+  `wte.W` applied once).
+- `flops.py`: the **corrected FLOPs accounting and the C9 check**.
+- `train.py`: the training loop on the real corpus, with the loss going down from the
+  C2 anchor of about ln 55.
+
+KV-cache (C8), sampling, generation and checkpointing stay out of scope until their
+phases.
