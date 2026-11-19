@@ -388,6 +388,11 @@ def test_shifted_causal_mask_referenced_only_in_attention_mask_module():
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == target:
                 used = True
+            elif isinstance(node, ast.Attribute) and node.attr == target:
+                # TL fixup: `attention_mask.shifted_causal_mask` (module
+                # attribute access) is an ast.Attribute, not an ast.Name, and
+                # was previously invisible to this guard.
+                used = True
             elif isinstance(node, ast.alias) and target in (node.name, node.asname):
                 used = True
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == target:
@@ -397,6 +402,20 @@ def test_shifted_causal_mask_referenced_only_in_attention_mask_module():
         if used:
             hits.append(fname)
     assert hits == [], f"'{target}' used as code outside attention_mask.py: {hits}"
+
+    # TL ruling (Sprint 2 integration): the literal SPRINT_2_PLAN.md §7.3
+    # criterion is a TEXT scan, and it is enforced too. Engineer A rephrased
+    # the one docstring that named the adversary, so prose mentions are no
+    # longer needed anywhere outside attention_mask.py; keeping the text scan
+    # also catches string-based lookups such as getattr(m, "shifted_causal_mask").
+    text_hits = []
+    for fname in sorted(os.listdir(nanogpt_dir)):
+        if not fname.endswith(".py") or fname == "attention_mask.py":
+            continue
+        with open(os.path.join(nanogpt_dir, fname), "r", encoding="utf-8") as fh:
+            if target in fh.read():
+                text_hits.append(fname)
+    assert text_hits == [], f"'{target}' appears in nanogpt/ outside attention_mask.py: {text_hits}"
 
     # Non-vacuity: the name must actually be defined where it belongs.
     mask_path = os.path.join(nanogpt_dir, "attention_mask.py")
