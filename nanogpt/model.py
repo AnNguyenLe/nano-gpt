@@ -16,20 +16,41 @@ bias in params. `named_parameters(params)` returns a per-role view that
 additionally maps "lm_head.W" to the SAME object as params["wte.W"]
 (identity, not a copy or a transpose).
 
-TL-16 (three layers of entry point, each with its own backward -- the
-backward half: embed_backward, backward_from_embedding, backward with the
-two C7 instrumentation flags, backward_loss -- lands in milestone B3, after
-this forward-only structure is frozen and committed):
+TL-16 (three layers of entry point, each with its own backward):
     embed(idx, params) -> (h0, cache)
+    embed_backward(d_h0, cache) -> {"wte.W": input-side, "wpe.W": ...}
     forward_from_embedding(h0, params) -> (logits, cache)
+    backward_from_embedding(d_logits, cache) -> (d_h0, d_params)
+        # every key except "wpe.W"; "wte.W" holds the OUTPUT-side
+        # contribution only (g_out below)
     forward(idx, params) -> (logits, cache)        # = embed then forward_from_embedding
+    backward(d_logits, cache, *, include_input_side=True, include_output_side=True)
+        -> (None, d_params)                        # all 4 + 16L keys, always present
     forward_loss(idx, targets, params) -> (loss, cache)   # via nanogpt/loss.py
+    backward_loss(d_loss, cache) -> (None, d_params)
 
 Forward:
     h0     = wte.W[idx] + wpe.W[arange(T)]           # ops.Embedding for both
     h_l    = Block_l(h_{l-1}),  l = 0..L-1
     y      = LN_f(h_L)
     logits = y @ params["wte.W"].T                   # tied head, NO bias
+
+Backward (TL-20 / C7):
+    g_out  = d_logits.reshape(-1,V).T @ y.reshape(-1,d)   # (V,d) output-side
+    dy     = d_logits @ params["wte.W"]
+    dh, g  = ln_f.backward(dy); blocks backward in reverse order
+    g_pos  = wpe.backward(dh.sum(axis=0))             # np.add.at inside Embedding
+    g_in   = wte.backward(dh)                         # input-side (np.add.at)
+    grads  : ops.accumulate_grads(grads, {"wte.W": g_out}) then
+             ops.accumulate_grads(grads, g_in)         # same array, += (C7)
+
+Every merge in this module goes through `ops.accumulate_grads`, called as a
+module attribute (`ops.accumulate_grads(...)`, never a bare import of the
+function), so C7 can monkeypatch it. There is no statement of the form
+`<dict>["wte.W"] = ...` anywhere in this file; the "wte.W" key is always
+built by passing a literal `{"wte.W": ...}` dict into `ops.accumulate_grads`.
+When a flag excludes a side, that side is simply not accumulated; "wte.W"
+is always present in the result (zeros if both sides are excluded).
 
 Validation: `idx` must be a 2-D integer array with 1 <= T <= cfg.T (else
 ValueError); out-of-range ids raise via `ops.Embedding`. No KV-cache
@@ -38,11 +59,13 @@ argument, no sampling, no training code (out of scope, section 13).
 Module contract (unchanged): forward(x, params) -> (out, cache);
 backward(d_out, cache) -> (d_x, d_params).
 
-Milestone B2 (SPRINT_3_PLAN.md section 6.1): constructor, param_keys,
-init_params, named_parameters, embed, forward_from_embedding, forward,
-forward_loss -- the param STRUCTURE IS FROZEN as of this commit (subject
-line ends "(structure final)"); any later change to keys/shapes needs TL
-approval and invalidates C1 (A's live param_count check).
+Milestone B2 (SPRINT_3_PLAN.md section 6.1, committed first): constructor,
+param_keys, init_params, named_parameters, embed, forward_from_embedding,
+forward, forward_loss -- the param structure was frozen as of that commit
+("structure final"); any later key/shape change needs TL approval and
+invalidates C1 (A's live param_count check). Milestone B3 (this commit):
+embed_backward, backward_from_embedding, backward (with the two C7 flags),
+backward_loss, and the dev gradcheck in tests/test_model.py.
 
 Owner: Engineer B. Files: nanogpt/model.py, tests/test_model.py.
 """
@@ -54,7 +77,7 @@ from nanogpt import loss as loss_mod
 from nanogpt import ops
 from nanogpt.attention_mask import causal_mask
 from nanogpt.block import Block
-from nanogpt.config import INT_DTYPE, ModelConfig
+from nanogpt.config import INT_DTYPE, ModelConfig, check_float64
 from nanogpt.layernorm import LayerNorm
 
 
@@ -139,6 +162,17 @@ class GPT:
         cache = {"c_wte": c_wte, "c_wpe": c_wpe, "B": B, "T": T}
         return h0, cache
 
+    def embed_backward(self, d_h0, cache: dict) -> dict:
+        check_float64(d_h0, names=["d_h0"])
+        _, g_wte = self.wte.backward(d_h0, cache["c_wte"])
+        d_pos = d_h0.sum(axis=0)  # (T, d), broadcast's adjoint
+        _, g_wpe = self.wpe.backward(d_pos, cache["c_wpe"])
+
+        grads: dict = {}
+        ops.accumulate_grads(grads, g_wte)
+        ops.accumulate_grads(grads, g_wpe)
+        return grads
+
     # -- entry point 2: forward_from_embedding -------------------------------
     def forward_from_embedding(self, h0, params: dict):
         h = h0
@@ -154,12 +188,66 @@ class GPT:
         cache = {"block_caches": block_caches, "c_lnf": c_lnf, "y": y, "wte_W": wte_W}
         return logits, cache
 
-    # -- entry point 3: forward (ids in, logits out) -------------------------
+    def _backward_through_lnf_and_blocks(self, d_logits, c_fe: dict):
+        """Shared by forward_from_embedding's and forward's backward: the
+        output-side contribution g_out, the gradient dh flowing back into
+        h0, and the merged grads for ln_f + every block (never "wte.W" or
+        "wpe.W", those are layered on by the two callers)."""
+        y = c_fe["y"]
+        wte_W = c_fe["wte_W"]
+        V, d = wte_W.shape
+        check_float64(d_logits, names=["d_logits"])
+
+        g_out = d_logits.reshape(-1, V).T @ y.reshape(-1, d)  # (V, d)
+        dy = d_logits @ wte_W  # (B, T, d)
+
+        grads: dict = {}
+        dh, g_lnf = self.ln_f.backward(dy, c_fe["c_lnf"])
+        ops.accumulate_grads(grads, g_lnf)
+        for b, c_b in zip(reversed(self.blocks), reversed(c_fe["block_caches"])):
+            dh, g_b = b.backward(dh, c_b)
+            ops.accumulate_grads(grads, g_b)
+        return dh, g_out, grads
+
+    def backward_from_embedding(self, d_logits, cache: dict):
+        dh, g_out, grads = self._backward_through_lnf_and_blocks(d_logits, cache)
+        ops.accumulate_grads(grads, {f"{self.wte.prefix}.W": g_out})
+        return dh, grads
+
+    # -- entry point 3: forward / backward (ids in, logits out) --------------
     def forward(self, idx, params: dict):
         h0, c_embed = self.embed(idx, params)
         logits, c_fe = self.forward_from_embedding(h0, params)
         cache = {"c_embed": c_embed, "c_fe": c_fe}
         return logits, cache
+
+    def backward(
+        self,
+        d_logits,
+        cache: dict,
+        *,
+        include_input_side: bool = True,
+        include_output_side: bool = True,
+    ):
+        c_embed = cache["c_embed"]
+        c_fe = cache["c_fe"]
+        wte_key = f"{self.wte.prefix}.W"
+
+        dh, g_out, grads = self._backward_through_lnf_and_blocks(d_logits, c_fe)
+
+        d_pos = dh.sum(axis=0)
+        _, g_wpe = self.wpe.backward(d_pos, c_embed["c_wpe"])
+        ops.accumulate_grads(grads, g_wpe)
+        _, g_wte_in = self.wte.backward(dh, c_embed["c_wte"])
+
+        if include_output_side:
+            ops.accumulate_grads(grads, {wte_key: g_out})
+        if include_input_side:
+            ops.accumulate_grads(grads, g_wte_in)
+        if wte_key not in grads:
+            ops.accumulate_grads(grads, {wte_key: np.zeros_like(c_fe["wte_W"])})
+
+        return None, grads
 
     # -- loss entry point -----------------------------------------------------
     def forward_loss(self, idx, targets, params: dict):
@@ -167,3 +255,8 @@ class GPT:
         loss, c_loss = loss_mod.cross_entropy_forward(logits, targets)
         cache = {"c_fwd": c_fwd, "c_loss": c_loss}
         return loss, cache
+
+    def backward_loss(self, d_loss, cache: dict):
+        d_logits, _ = loss_mod.cross_entropy_backward(d_loss, cache["c_loss"])
+        _, grads = self.backward(d_logits, cache["c_fwd"])
+        return None, grads

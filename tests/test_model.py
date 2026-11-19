@@ -1,14 +1,14 @@
-"""tests/test_model.py -- Engineer B, Sprint 3 Phase 3 (S3-03, milestone B2).
+"""tests/test_model.py -- Engineer B, Sprint 3 Phase 3 (S3-03, milestones B2/B3).
 
-Covers `nanogpt.model.GPT`'s forward-only structure (the backward half --
-B3's dev gradcheck and the two C7 instrumentation flags -- is added by a
-later commit, after this structure is frozen): param_keys order, init,
-tied head identity, C-contiguity, shape/validation of `embed`/`forward`,
-the mask_fn plumbing (single callable vs. per-block list vs. wrong
-length), the exact `forward == forward_from_embedding(embed(...))`
-identity, and the tied-head anchor. The formal, full-coverage C6
-gradcheck (all 36 tensors, TL-9 for every layer) is Engineer C's
-`tests/test_gradients.py`.
+Covers `nanogpt.model.GPT`: structure (param_keys order, init, tied head
+identity, C-contiguity), shape/validation of `embed`/`forward`, the
+mask_fn plumbing (single callable vs. per-block list vs. wrong length),
+the exact `forward == forward_from_embedding(embed(...))` identity, the
+tied-head anchor, and (B3) a cheap dev gradcheck of the full ids-based
+forward/backward plus the two C7 instrumentation flags. The formal,
+full-coverage C6 gradcheck (all 36 tensors, TL-9 for every layer) is
+Engineer C's `tests/test_gradients.py`; this file only needs a small,
+fast sanity gradcheck per section 6.3.
 
 Fixture seed (SPRINT_3_PLAN.md section 4): `_FIXTURE_SEED = DEFAULT_SEED + 312`.
 """
@@ -18,10 +18,35 @@ import numpy as np
 import pytest
 
 from nanogpt.attention_mask import causal_mask, shifted_causal_mask
-from nanogpt.config import DEFAULT_SEED, ROUNDOFF_ATOL, ModelConfig, make_rng, tiny_config
+from nanogpt.config import (
+    DEFAULT_SEED,
+    GRADCHECK_TOL,
+    ROUNDOFF_ATOL,
+    ModelConfig,
+    make_rng,
+    tiny_config,
+)
+from nanogpt.gradcheck import gradcheck
 from nanogpt.model import GPT
 
 _FIXTURE_SEED = DEFAULT_SEED + 312
+
+
+def _non_init_params(model, rng):
+    """Sprint-3-wide "non-init fixture" (SPRINT_3_PLAN.md section 3.6)."""
+    params = model.init_params(rng)
+    out = {}
+    for key, v in params.items():
+        v = np.asarray(v, dtype=np.float64)
+        if key.endswith(".gamma"):
+            out[key] = np.ascontiguousarray(1.0 + 0.3 * rng.standard_normal(v.shape))
+        elif key.endswith(".beta") or key.endswith(".b"):
+            out[key] = np.ascontiguousarray(0.3 * rng.standard_normal(v.shape))
+        elif key.endswith(".W"):
+            out[key] = np.ascontiguousarray(v + 0.3 * rng.standard_normal(v.shape))
+        else:
+            raise AssertionError(f"unexpected param key suffix: {key!r}")
+    return out
 
 
 def _tiny_cfg(V=55):
@@ -234,3 +259,68 @@ def test_non_callable_non_sequence_mask_fn_raises():
     cfg = _tiny_cfg()
     with pytest.raises(ValueError):
         GPT(cfg, mask_fn="not callable")
+
+
+# ---------------------------------------------------------------------------
+# B3: cheap dev gradcheck, L=1, d=8, H=2, T=3, V=11, logits objective.
+# ---------------------------------------------------------------------------
+def test_dev_gradcheck_tiny_model_logits_objective():
+    cfg = ModelConfig(V=11, T=3, d=8, L=1, H=2)
+    model = GPT(cfg)
+    rng = make_rng(_FIXTURE_SEED + 100)
+    params = _non_init_params(model, rng)
+    idx = rng.integers(0, cfg.V, size=(2, cfg.T)).astype(np.int64)
+
+    report = gradcheck(model.forward, model.backward, params, idx)
+    print(report)
+
+    assert set(report.tensors) == set(model.param_keys())
+    for name, t in report.tensors.items():
+        if name == "h.0.attn.k.b":
+            continue  # TL-9: structural zero, gated at block/module level (B's and C's suites)
+        assert t.rel_err < GRADCHECK_TOL, (name, t)
+
+
+def test_backward_flags_both_false_gives_zero_wte_and_unchanged_others():
+    cfg = ModelConfig(V=11, T=3, d=8, L=1, H=2)
+    model = GPT(cfg)
+    rng = make_rng(_FIXTURE_SEED + 101)
+    params = _non_init_params(model, rng)
+    idx = rng.integers(0, cfg.V, size=(2, cfg.T)).astype(np.int64)
+
+    logits, cache = model.forward(idx, params)
+    d_logits = rng.standard_normal(logits.shape).astype(np.float64)
+
+    _, grads_full = model.backward(d_logits, cache)
+    _, grads_none = model.backward(
+        d_logits, cache, include_input_side=False, include_output_side=False
+    )
+
+    assert set(grads_none) == set(model.param_keys())
+    assert np.all(grads_none["wte.W"] == 0.0)
+    for key in grads_full:
+        if key == "wte.W":
+            continue
+        assert np.array_equal(grads_full[key], grads_none[key]), key
+
+
+def test_backward_flags_partial_sum_to_full():
+    cfg = ModelConfig(V=11, T=3, d=8, L=1, H=2)
+    model = GPT(cfg)
+    rng = make_rng(_FIXTURE_SEED + 102)
+    params = _non_init_params(model, rng)
+    idx = rng.integers(0, cfg.V, size=(2, cfg.T)).astype(np.int64)
+
+    logits, cache = model.forward(idx, params)
+    d_logits = rng.standard_normal(logits.shape).astype(np.float64)
+
+    _, grads_full = model.backward(d_logits, cache)
+    _, grads_in = model.backward(d_logits, cache, include_output_side=False)
+    _, grads_out = model.backward(d_logits, cache, include_input_side=False)
+
+    recombined = grads_in["wte.W"] + grads_out["wte.W"]
+    max_abs = float(np.max(np.abs(recombined - grads_full["wte.W"])))
+    print("partial-sum max_abs=", max_abs)
+    assert max_abs <= ROUNDOFF_ATOL
+    assert float(np.linalg.norm(grads_in["wte.W"])) > 1e-6
+    assert float(np.linalg.norm(grads_out["wte.W"])) > 1e-6
