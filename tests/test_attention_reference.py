@@ -9,9 +9,9 @@ Covers:
   AST source guard.
 
 Milestone A1 (committed): attention_mask.py + its mask tests below.
-Milestone A2 (this commit): the oracle (nanogpt/attention_reference.py) and
+Milestone A2 (committed): the oracle (nanogpt/attention_reference.py) and
 its closed-form anchors.
-Milestone A3 (later commit): the oracle's AST source guard.
+Milestone A3 (this commit): the oracle's AST source guard.
 
 Per TL-13 (SPRINT_2_PLAN.md section 2.2 / 5.3): every fixture tensor is
 drawn from one Generator per fixture, seeded with
@@ -23,7 +23,10 @@ is forward-only and has no backward to gradcheck).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import math
+import textwrap
 
 import numpy as np
 import pytest
@@ -336,3 +339,86 @@ def test_oracle_inputs_bit_identical_after_call():
     assert np.array_equal(x, x_snapshot)
     for k in params:
         assert np.array_equal(params[k], params_snapshot[k])
+
+
+# ===========================================================================
+# Source guard: reference_attention_forward must never use reshape,
+# transpose, swapaxes, moveaxis, einsum, .T, or inf.
+# ===========================================================================
+_FORBIDDEN_ATTRS = {"reshape", "transpose", "swapaxes", "moveaxis", "einsum", "T", "inf"}
+_FORBIDDEN_NAMES = {"reshape", "transpose", "swapaxes", "moveaxis", "einsum", "inf"}
+
+
+def _scan_tree_for_forbidden_tokens(tree):
+    """Walk an already-parsed AST and report every forbidden attribute
+    access (e.g. `x.transpose(`, `x.T`, `np.inf`) or bare name use. `T` is
+    only forbidden as an *attribute* (`.T`); a local variable named `T`
+    (the sequence length, as used throughout the oracle) is an
+    `ast.Name`/Store/Load, never an `ast.Attribute`, so it is correctly
+    left alone.
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_ATTRS:
+            hits.append((node.lineno, node.attr))
+        elif isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+            hits.append((node.lineno, node.id))
+    return hits
+
+
+def _scan_function_for_forbidden_tokens(func):
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    return _scan_tree_for_forbidden_tokens(tree)
+
+
+def test_source_guard_reference_attention_forward_is_clean():
+    hits = _scan_function_for_forbidden_tokens(reference_attention_forward)
+    assert hits == [], f"forbidden tokens found in reference_attention_forward: {hits}"
+
+
+def test_source_guard_test_the_test_flags_transpose_snippet():
+    """The scanner itself must be discriminating: fed a snippet that uses
+    `.transpose(`, it must flag it."""
+    src = textwrap.dedent(
+        """
+        def _broken(x):
+            return x.transpose(0, 2, 1)
+        """
+    )
+    tree = ast.parse(src)
+    hits = _scan_tree_for_forbidden_tokens(tree)
+    assert any(tok == "transpose" for _, tok in hits)
+
+
+def test_source_guard_test_the_test_flags_dot_T_and_inf():
+    src = textwrap.dedent(
+        """
+        def _broken(x):
+            y = x.T
+            return np.where(y > 0, y, -np.inf)
+        """
+    )
+    tree = ast.parse(src)
+    hits = _scan_tree_for_forbidden_tokens(tree)
+    tokens = {tok for _, tok in hits}
+    assert "T" in tokens
+    assert "inf" in tokens
+
+
+def test_source_guard_scanner_ignores_local_variable_named_T():
+    """Regression: a bare local variable named `T` (sequence length) is
+    never flagged -- only the `.T` attribute is forbidden."""
+    src = textwrap.dedent(
+        """
+        def _fine(x):
+            T = x.shape[0]
+            total = 0
+            for i in range(T):
+                total += i
+            return total
+        """
+    )
+    tree = ast.parse(src)
+    hits = _scan_tree_for_forbidden_tokens(tree)
+    assert hits == []
