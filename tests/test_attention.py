@@ -22,7 +22,8 @@ import numpy as np
 import pytest
 
 from nanogpt.attention import CausalSelfAttention, _merge_heads, _split_heads
-from nanogpt.attention_mask import causal_mask
+from nanogpt.attention_mask import causal_mask, shifted_causal_mask
+from nanogpt.attention_reference import reference_attention_forward
 from nanogpt.config import (
     DEFAULT_SEED,
     INIT_STD,
@@ -60,6 +61,17 @@ def _tiny_gradcheck_fixture():
     params = _non_init_params(rng, d)
     x = rng.standard_normal((B, T, d)).astype(np.float64)
     return attn, params, x
+
+
+def _oracle_case(d, H, B, T, seed, mask_fn=causal_mask):
+    rng = make_rng(seed)
+    attn = CausalSelfAttention("attn", d, H, mask_fn=mask_fn)
+    params = _non_init_params(rng, d)
+    x = rng.standard_normal((B, T, d)).astype(np.float64)
+    out, _ = attn.forward(x, params)
+    ref = reference_attention_forward(x, params, H, mask_fn=mask_fn)
+    max_abs = float(np.max(np.abs(out - ref)))
+    return max_abs
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +181,47 @@ def test_cache_P_masked_zero_and_rows_sum_to_one():
 
     row_sums = P.sum(axis=-1)
     assert np.max(np.abs(row_sums - 1.0)) <= ROUNDOFF_ATOL
+
+
+# ---------------------------------------------------------------------------
+# Oracle forward match (S2-07, HARD GATE). Milestone B2: this must pass
+# before the backward (B3) is trusted (SPRINT_2_PLAN.md section 9).
+# ---------------------------------------------------------------------------
+def test_oracle_match_tiny():
+    m = _oracle_case(8, 2, 2, 4, seed=_FIXTURE_SEED + 10)
+    print("oracle match tiny (d=8,H=2,B=2,T=4) max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
+
+
+def test_oracle_match_default_H4_d64():
+    m = _oracle_case(64, 4, 2, 7, seed=_FIXTURE_SEED + 11)
+    print("oracle match default (d=64,H=4,B=2,T=7) max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
+
+
+@pytest.mark.parametrize("H", [1, 2, 4, 8])
+def test_oracle_match_head_sweep_d8_T5(H):
+    m = _oracle_case(8, H, 2, 5, seed=_FIXTURE_SEED + 20 + H)
+    print(f"oracle match d=8,T=5,H={H} max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
+
+
+def test_oracle_match_T1():
+    m = _oracle_case(8, 2, 2, 1, seed=_FIXTURE_SEED + 30)
+    print("oracle match T=1 max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
+
+
+def test_oracle_match_B3():
+    m = _oracle_case(8, 2, 3, 4, seed=_FIXTURE_SEED + 31)
+    print("oracle match B=3 max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
+
+
+def test_oracle_match_tiny_with_shifted_mask():
+    """The tiny case also passes with mask_fn=shifted_causal_mask in both
+    implementations: shows the mask_fn plumbing is identical in the two
+    implementations, independent of masking correctness."""
+    m = _oracle_case(8, 2, 2, 4, seed=_FIXTURE_SEED + 32, mask_fn=shifted_causal_mask)
+    print("oracle match tiny, shifted mask, max_abs=", m)
+    assert m <= ROUNDOFF_ATOL
