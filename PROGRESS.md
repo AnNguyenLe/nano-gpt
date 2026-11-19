@@ -252,3 +252,184 @@ the execution plan:
   rel_err reports 0.
 - The shifted-mask adversarial test: a mask `j ≤ i+1` must be caught by a
   causality / future-leak check.
+
+---
+
+## Phase 2 — Causal Multi-Head Self-Attention  [DONE 2026-11-20]
+
+**Process (S2-00, approved by the user: "fold that into Sprint 2"):** this was the
+first sprint where the team committed as it worked, under per-role identities set
+only by `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment variables (no `git config`
+writes), with explicit pathspecs. TL fixups are separate commits. Sprint 1 history
+(`283c20f`..`74044c4`) still has its original hashes (ancestry checked).
+
+**Owners / commits (each verified with `git show --stat` to touch only the owner's files):**
+
+| Role | Commits | Files |
+|---|---|---|
+| Engineer A | `9e1849f` [A1] masks, `eb185c0` [A2] oracle + anchors, `d36dd45` [A3] oracle source guard | `nanogpt/attention_mask.py`, `nanogpt/attention_reference.py`, `tests/test_attention_reference.py` |
+| Engineer B | `1276ee6` [B1] forward, `53105eb` [B2] oracle match (hard gate), `c579179` [B3] backward + gradcheck, `4f92d66` [B4] test-the-tests | `nanogpt/attention.py`, `tests/test_attention.py` |
+| Engineer C | `13e0519` [C1-C3] in one commit (see D1) | `tests/test_causal_mask.py` |
+| Tech Lead | `31016a0` kickoff plan; `267028f`, `dfffd66` TL fixups; Sprint 2 sign-off commit | `SPRINT_2_PLAN.md`, `tests/test_conventions.py`, `tests/test_causal_mask.py` (fixup), `PROGRESS.md` |
+
+The §9 ordering holds: `[A1] 9e1849f < [B1] 1276ee6`, and
+`[A2] eb185c0 < [B2] 53105eb < [B3] c579179 < [B4] 4f92d66`.
+
+### What Sprint 2 delivered
+
+| Area | Files | Status |
+|---|---|---|
+| Causal + shifted-adversary masks (bool `allowed`, fresh array per call) | `nanogpt/attention_mask.py` | done |
+| Naive loop-over-heads oracle (no reshape/transpose/einsum/`.T`/`inf`, enforced by AST guard) | `nanogpt/attention_reference.py` | done, closed-form anchors pass |
+| Vectorized `CausalSelfAttention` (separate Q/K/V/O `ops.Linear`, TL-11 head split, `np.where` −∞ mask, hand-derived backward reusing `ops.softmax_backward`) | `nanogpt/attention.py` | done, matches oracle, gradcheck passes |
+| C5 isolated, shifted-mask test-the-test, T=1, backward causality, masked-softmax rank | `tests/test_causal_mask.py` | done |
+
+### Real test status (TL run on the integrated tree)
+
+`.venv/Scripts/python.exe -m pytest tests/ -q` gives **256 passed in about 1.7 s**,
+identical over two consecutive runs. (254 from the engineers plus 2 tests added by
+TL fixup `267028f`.) Every file is far under the 10 s budget:
+
+| File | Tests | Time |
+|---|---|---|
+| test_attention.py (B) | 36 | 0.67 s |
+| test_attention_reference.py (A) | 46 | 0.19 s |
+| test_causal_mask.py (C) | 14 | 0.30 s |
+| test_conventions.py | 21 | 0.10 s |
+| Sprint 1 files (config, gradcheck_harness, tokenizer, ops, softmax_properties, layernorm, layernorm_rank, loss) | 139 | each ≤ 0.5 s |
+
+The corpus SHA-256 re-computed by the TL is still `7afc055a…2854`, with V=55 (matches
+Phase 0). `TODO(SPRINT` finds nothing in `nanogpt/`. No torch/jax/tf/autograd imports.
+No Phase 3+ file exists and `attention.py` has no KV-cache argument.
+
+### Gradcheck tables (TL re-measurement, own fixture seed `DEFAULT_SEED+900`; gated: norm-wise rel_err < 1e-6)
+
+Tiny config d=8, H=2, B=2, T=4 (all 9 tensors):
+
+| Tensor | rel_err | max_elem_rel_err | max_abs_err |
+|---|---|---|---|
+| attn.q.W | 3.2e-11 | 1.6e-09 | 1.5e-10 |
+| attn.q.b | 1.2e-11 | 1.3e-09 | 4.1e-11 |
+| attn.k.W | 3.4e-11 | 2.1e-09 | 1.6e-10 |
+| **attn.k.b (TL-9)** | 5.9e-03 (not gated) | 2.2e-03 | **2.2e-11 ≤ REL_ERR_FLOOR** |
+| attn.v.W | 1.2e-11 | 8.4e-10 | 1.1e-10 |
+| attn.v.b | 7.4e-12 | 2.3e-09 | 6.2e-11 |
+| attn.o.W | 5.1e-12 | 5.1e-10 | 5.6e-11 |
+| attn.o.b | 2.2e-12 | 5.3e-12 | 1.7e-11 |
+| x | 3.4e-11 | 2.6e-09 | 8.6e-11 |
+
+Backward-vs-oracle adapter (FD differentiates the **oracle**, analytic side is B's
+backward): every non-k.b tensor has rel_err in [2.2e-12, 3.5e-11], and k.b has
+max_abs_err 4.4e-11 ≤ REL_ERR_FLOOR. B's second gradcheck at d=16, H=4, B=1, T=3 is
+green in the suite.
+
+**TL-9 (b_k structural zero), protocol (a)–(d):** analytic max|db_k| = 3.6e-16
+(≤ 1e-12). FD max_abs_err = 2.2e-11 (≤ 1e-8). Invariance max|out(b_k+10N) − out| =
+7.5e-16. The dropped-term softmax backward gives max|db_k| = 4.25, so the protocol
+discriminates.
+
+### Oracle match (S2-07 hard gate; all ≤ ROUNDOFF_ATOL = 1e-12)
+
+Tiny (d=8, H=2, B=2, T=4) 2.2e-16. Default (d=64, H=4, B=2, T=7) 6.7e-16. H-sweep at
+d=8, T=5: H=1 2.2e-16, H=2 3.3e-16, H=4 3.3e-16, H=8 1.7e-16. T=1 0.0. B=3 2.2e-16.
+The tiny case also matches with `shifted_causal_mask` in both implementations
+(B's test).
+
+### C5 isolated (T=4, d=8, H=2; numerical Jacobian via `gradcheck.numerical_jacobian`)
+
+| Mask | Implementation | future max (s>t) | past min ‖block‖_F (s≤t) | leak ‖J[t,t+1]‖_F min / max | s≥t+2 max |
+|---|---|---|---|---|---|
+| causal | vectorized | **0.0** | 0.57 | n/a | 0.0 |
+| causal | oracle | **0.0** | 0.57 | n/a | 0.0 |
+| shifted `j ≤ i+1` | vectorized | 0.61, **C5 fails** | 0.57 | 0.52 / 1.68 | **0.0** |
+| shifted `j ≤ i+1` | oracle | 0.61, **C5 fails** | 0.57 | 0.52 / 1.68 | **0.0** |
+
+The shifted adversary is substituted for real via `mask_fn` (not inspected). It leaks
+exactly at s = t+1 and nowhere at s ≥ t+2, so the check catches the one-extra-token
+leak precisely. C's suite additionally covers: backward causality (the analytic
+Jacobian from one-hot upstream gradients is ≤ 1e-12 for s > t and matches FD), batch
+independence, a d=64/H=4/T=6 spot check, and the strict-mask `j < i` NaN case, kept
+separate as *not* the C5 adversary.
+
+### T=1 degenerate case
+
+At B=2, T=1, dW_q, db_q, dW_k and db_k are **exactly 0** (`np.all(g == 0)`). Gradcheck
+reports rel_err **== 0.0** for all four and `passed=True` over all 9 tensors. The
+anchor `out == (xW_v+b_v)W_o+b_o` holds with diff 0.0. Paired T=4 run (same weights,
+new x): ‖dW_q‖ = 7.8, ‖db_q‖ = 2.3, ‖dW_k‖ = 5.8, and max|db_k| = 2.5e-16 (TL-9: zero
+at every T). C's disconnection adversary (Q ignored) is rejected by the paired helper.
+
+### Masked-softmax rank (F5)
+
+Causal row i of `cache["P"]` has a softmax Jacobian of rank exactly i: ranks
+[0,1,2,3] for both heads.
+
+### Test-the-test (each broken variant is detected)
+
+- **Interleaved head split (F7):** gradcheck **passes** (worst non-k.b rel_err 5.9e-11,
+  so gradcheck is blind to this bug class), while the oracle differs by **1.36**. This
+  is why the oracle is mandatory.
+- **No-transpose split:** the oracle differs by 3.35.
+- **Dropped fan-out** (d_x = dx_v only): the x gradcheck fails (B's test).
+- **Missing scale in backward:** the q.W and k.W gradchecks fail (B's test).
+- **TL-9 dropped term:** max|db_k| = 4.25.
+- **Shifted mask:** C5 fails on both implementations.
+- **Q disconnection:** the paired non-zero helper rejects it.
+- **Oracle source guard:** flags `.transpose(`, `.T` and `np.inf`, and correctly
+  ignores a local variable named `T`.
+
+### Integration fixes made by the TL (separate commits)
+
+1. **`267028f` TL fixup: `tests/test_conventions.py`.** Widened the shim-marker guard
+   from `TODO(SPRINT1-` to `TODO(SPRINT` (planned §10 item 1, not yet done), plus a
+   parametrized test-the-test for SPRINT2/SPRINT3 markers.
+2. **`dfffd66` TL fixup: `tests/test_causal_mask.py`.** C's AST-based adversary guard
+   matched only `Name` / `alias` / `def` nodes, so
+   `attention_mask.shifted_causal_mask` (an `ast.Attribute`) slipped through. Added the
+   Attribute case, and also enforced the literal §7.3 **text** scan. That scan is now
+   satisfiable because A rephrased the one docstring that named the adversary, and it
+   also catches `getattr(m, "shifted_causal_mask")`. Both adversaries were verified
+   ad hoc (in a scratch copy) to make the guard fail.
+
+### Deviations from SPRINT_2_PLAN.md
+
+- **D1 (process; not fixable without rewriting history):** Engineer C committed C1+C2+C3
+  as one commit (`13e0519`) **before** its dependencies A2 and B1/B3 were committed. C
+  ran its tests against teammates' *uncommitted* working-tree files. As a result, the
+  committed trees at `13e0519`, `eb185c0` and `d36dd45` fail test collection
+  (`attention.py` not yet committed), and `1276ee6` and `53105eb` have 3 failing C tests
+  (backward not yet committed). The tree is green from `c579179` onward and at HEAD.
+  This is recorded rather than rewritten (no rebase, per the git rules). **For
+  bisecting, treat `9e1849f` and `c579179` onward as the known-green Sprint 2 points.**
+- **D2:** Engineer B developed against local, uncommitted stand-ins for A's mask and
+  oracle files, as §9 allows. A overwrote them with the spec-exact versions before
+  committing, and B's B2–B4 numbers were measured against A's committed files. No drift.
+- **D3:** A's `attention_reference.py` docstring was rephrased so it no longer names
+  the adversary. The TL ruling is that **both** the AST guard (C) and the literal text
+  scan (§7.3) are enforced.
+- Interpretations carried as planned: **R12** (oracle and masks in their own files,
+  different owner), **R13** (per-owner test files; `tests/test_gradients.py` still
+  reserved for C6), **R14** (PO's T>1 b_k expectation corrected), **TL-9** (b_k
+  structural-zero gate, **FOR PO RATIFICATION**), **TL-10** (separate Q/K/V/O, no
+  fused QKV). Carried from Sprint 1: TL-1, R4, R5, R6.
+
+### Open items / watch items for Sprint 3
+
+- **C5 is NOT retired.** The full-model C5 re-run is owed in Phase 3, on the assembled
+  model (embeddings + L blocks + final LN + lm_head). It includes the shifted-mask
+  test-the-test, substituted through every block's `mask_fn`.
+- **TL-9 applies to every block's `attn.k.b` in C6** (full-model gradcheck). Use the
+  same (a)–(d) protocol, not the literal rel_err gate.
+- **Weight tying (C7):** gradcheck the contiguous `wte.W`, never a transposed view (the
+  harness refuses non-contiguous params).
+- **Process lesson from D1:** before committing, each engineer runs their test file
+  against the **committed** tree plus their own staged files (e.g. `git archive HEAD |
+  tar -x -C <scratch>`), never against teammates' uncommitted files. A test is
+  committed only once every module it imports is committed.
+
+**Next: Phase 3 — Transformer Block & Full Model Assembly (Sprint 3).** Scope per the
+execution plan: `mlp.py` (Linear–GELU–Linear), `block.py` (pre-LN residual block:
+x + attn(LN(x)), x + mlp(LN(x))) and `model.py` (token + positional embeddings, L
+blocks, final LN, tied lm_head). Also `param_count.py` (C1), the full-model gradcheck
+in `tests/test_gradients.py` (C6, with TL-9 for every b_k), C7 weight tying, and the
+**C5 re-run on the full model**.
