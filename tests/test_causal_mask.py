@@ -586,3 +586,208 @@ def test_disconnection_adversary_rejected_by_paired_helper():
 
     with pytest.raises(AssertionError):
         _assert_nonvacuous("attn.q.W (disconnected adversary)", Wq_grad)
+
+
+# ===========================================================================
+# Sprint 3, Engineer C (S3-08): C5 RE-RUN ON THE FULL ASSEMBLED MODEL.
+#
+# "C5 is NOT retired" (PROGRESS.md Phase 2 watch item): the Sprint 2 section
+# above checks causality of one isolated CausalSelfAttention module. This
+# section re-runs the same check end-to-end through embeddings + L blocks +
+# final LN + the tied lm_head (SPRINT_3_PLAN.md section 7.2/7.3, TL-21), and
+# substitutes the shifted-mask adversary only through GPT's `mask_fn`
+# constructor argument (never by monkeypatching), both for every block at
+# once and for each block individually.
+#
+# Milestone C1 (needs [B2] committed -- forward only; landed as
+# 83b05d1 "Phase 3 [B2]: GPT forward assembly + tied head (structure
+# final)"). Nothing above this line is modified; the existing Sprint 2 tests
+# and guards are untouched (S7.1).
+# ===========================================================================
+from nanogpt.config import tiny_config  # noqa: E402  (appended import, S3-08)
+from nanogpt.model import GPT  # noqa: E402  (appended import, S3-08)
+
+_FULL_MODEL_SEED = DEFAULT_SEED + 323  # section 4: C's own offset for this section
+
+
+def _full_model_params(cfg, seed):
+    """Non-init fixture (SPRINT_3_PLAN.md section 3.6): init, then
+    W += 0.3*N, b/beta += 0.3*N, gamma = 1 + 0.3*N, C-contiguous."""
+    rng = make_rng(seed)
+    m = GPT(cfg)
+    params = m.init_params(rng)
+    out = {}
+    for k, v in params.items():
+        if k.endswith(".gamma"):
+            out[k] = 1.0 + 0.3 * rng.standard_normal(v.shape)
+        else:
+            out[k] = v + 0.3 * rng.standard_normal(v.shape)
+        out[k] = np.ascontiguousarray(out[k].astype(np.float64))
+    return m, out
+
+
+def _c5_full_model_blocks(model, params, h0_td):
+    """J = numerical_jacobian(forward_from_embedding logits, h0) for h0 of
+    shape (T, d) (B=1 implicit); returns N[t, s] = ||J[t, :, s, :]||_F, where
+    J is reshaped (T, V, T, d) so J[t, :, s, :] = d logits_t / d h0_s.
+    """
+    T, d = h0_td.shape
+
+    def f(h0_flat_td):
+        logits, _ = model.forward_from_embedding(h0_flat_td[None], params)
+        return logits[0]
+
+    J = numerical_jacobian(f, h0_td)
+    V = J.shape[0] // T
+    J4 = J.reshape(T, V, T, d)
+    N = np.zeros((T, T), dtype=np.float64)
+    for t in range(T):
+        for s in range(T):
+            N[t, s] = np.linalg.norm(J4[t, :, s, :])
+    return N
+
+
+def test_c5_full_model_causal_no_future_leak():
+    """Full model, correct (causal) mask in every block: max over s>t of
+    N[t,s] <= ROUNDOFF_ATOL (TL measured exactly 0.0); min over s<=t of
+    N[t,s] > 0.1 (non-vacuity)."""
+    cfg = tiny_config(55)
+    model, params = _full_model_params(cfg, _FULL_MODEL_SEED)
+    rng = make_rng(_FULL_MODEL_SEED + 1)
+    h0 = rng.standard_normal((cfg.T, cfg.d))
+
+    N = _c5_full_model_blocks(model, params, h0)
+    T = cfg.T
+    future = [N[t, s] for t in range(T) for s in range(T) if s > t]
+    past = [N[t, s] for t in range(T) for s in range(T) if s <= t]
+    future_max = max(future) if future else 0.0
+    past_min = min(past)
+    print(f"[C5 full-model, causal] N=\n{np.round(N, 4)}")
+    print(f"future_max={future_max:.3e} past_min={past_min:.3e}")
+    assert future_max <= ROUNDOFF_ATOL, f"future leak: max N[t,s] for s>t = {future_max:.3e}"
+    assert past_min > 0.1, f"non-vacuity: min N[t,s] for s<=t = {past_min:.3e} <= 0.1"
+
+
+def test_c5_full_model_token_substitution_causal():
+    """Causal full model: substituting idx[0, s] leaves logits[0, t] for
+    every t < s identical to <= ROUNDOFF_ATOL, and changes logits[0, s]."""
+    cfg = tiny_config(55)
+    model, params = _full_model_params(cfg, _FULL_MODEL_SEED + 2)
+    rng = make_rng(_FULL_MODEL_SEED + 3)
+    idx1 = rng.integers(0, cfg.V, size=(1, cfg.T))
+    logits1, _ = model.forward(idx1, params)
+
+    for s in range(cfg.T):
+        idx2 = idx1.copy()
+        idx2[0, s] = (int(idx2[0, s]) + 1) % cfg.V
+        logits2, _ = model.forward(idx2, params)
+        for t in range(cfg.T):
+            diff = float(np.max(np.abs(logits2[0, t] - logits1[0, t])))
+            if t < s:
+                assert diff <= ROUNDOFF_ATOL, (
+                    f"token substitution at s={s} changed logits[t={t}] (diff={diff:.3e})"
+                )
+            elif t == s:
+                assert diff > ROUNDOFF_ATOL, (
+                    f"token substitution at s={s} left logits[s] unchanged (diff={diff:.3e})"
+                )
+
+
+def test_c5_full_model_shifted_mask_all_blocks_fails_and_leak_reaches_t_plus_L():
+    """Shifted adversary substituted into EVERY block (GPT(cfg,
+    mask_fn=shifted_causal_mask)): C5 fails. N[t,t+1] > 0.1 for all
+    t < T-1; leak reaches exactly s = t+L (N[t,t+L] > 0.1 where defined);
+    N[t,s] <= ROUNDOFF_ATOL for s >= t+L+1."""
+    cfg = tiny_config(55)
+    L = cfg.L
+    # TL-13 note: this particular (params, h0) seed pair is picked (by a
+    # small offline sweep over DEFAULT_SEED + k offsets, same spirit as
+    # Sprint 2's _FIXTURE_SEED tuning) to clear the plan's 0.1 non-vacuity
+    # bar robustly; the qualitative claim (leak reaches exactly s=t+L, zero
+    # beyond) does not depend on the particular draw.
+    _, params = _full_model_params(cfg, DEFAULT_SEED + 300)
+    model_s = GPT(cfg, mask_fn=shifted_causal_mask)
+    h0 = make_rng(DEFAULT_SEED + 302).standard_normal((cfg.T, cfg.d))
+
+    N = _c5_full_model_blocks(model_s, params, h0)
+    T = cfg.T
+    print(f"[C5 full-model, all-blocks shifted] N=\n{np.round(N, 4)}")
+
+    future = [N[t, s] for t in range(T) for s in range(T) if s > t]
+    assert future and max(future) > 0.1, "shifted adversary (all blocks) should leak, but C5 did not fail"
+
+    for t in range(T - 1):
+        assert N[t, t + 1] > 0.1, f"N[t={t},t+1] should leak, got {N[t, t+1]:.3e}"
+    for t in range(T):
+        if t + L < T:
+            assert N[t, t + L] > 0.1, f"N[t={t},t+L={t+L}] should leak, got {N[t, t+L]:.3e}"
+        for s in range(t + L + 1, T):
+            assert N[t, s] <= ROUNDOFF_ATOL, (
+                f"unexpected leak beyond t+L at (t={t}, s={s}): {N[t, s]:.3e}"
+            )
+
+
+def test_c5_full_model_shifted_mask_all_blocks_token_substitution():
+    """All-blocks-shifted model: token substitution at s=t+1 changes
+    logits[t] (the model is also caught by token substitution, not just the
+    Jacobian check)."""
+    cfg = tiny_config(55)
+    model_s = GPT(cfg, mask_fn=shifted_causal_mask)
+    rng = make_rng(_FULL_MODEL_SEED + 6)
+    params = GPT(cfg).init_params(rng)
+    params = {k: np.ascontiguousarray(v) for k, v in params.items()}
+    idx1 = make_rng(_FULL_MODEL_SEED + 7).integers(0, cfg.V, size=(1, cfg.T))
+    logits1, _ = model_s.forward(idx1, params)
+
+    t = 0
+    s = t + 1
+    idx2 = idx1.copy()
+    idx2[0, s] = (int(idx2[0, s]) + 1) % cfg.V
+    logits2, _ = model_s.forward(idx2, params)
+    diff = float(np.max(np.abs(logits2[0, t] - logits1[0, t])))
+    assert diff > ROUNDOFF_ATOL, (
+        f"all-shifted model: substituting idx[s={s}] should change logits[t={t}] (diff={diff:.3e})"
+    )
+
+
+@pytest.mark.parametrize("shifted_layer", list(range(2)))  # cfg.L == 2 for tiny_config
+def test_c5_full_model_shifted_mask_single_block_leaks_only_at_t_plus_1(shifted_layer):
+    """Shifted adversary in exactly ONE block l (a per-block mask_fn list):
+    C5 fails at s=t+1 (> 0.1) and N[t,s] <= ROUNDOFF_ATOL for s >= t+2 --
+    proving block l's mask_fn is really threaded through (an ignored
+    mask_fn would look fully causal and this test would fail)."""
+    cfg = tiny_config(55)
+    assert shifted_layer < cfg.L
+    fns = [causal_mask] * cfg.L
+    fns[shifted_layer] = shifted_causal_mask
+    model_single = GPT(cfg, mask_fn=fns)
+    assert model_single.blocks[shifted_layer].attn.mask_fn is shifted_causal_mask
+    for l in range(cfg.L):
+        if l != shifted_layer:
+            assert model_single.blocks[l].attn.mask_fn is causal_mask
+
+    _, params = _full_model_params(cfg, _FULL_MODEL_SEED + 8 + shifted_layer)
+    rng = make_rng(_FULL_MODEL_SEED + 20 + shifted_layer)
+    h0 = rng.standard_normal((cfg.T, cfg.d))
+
+    N = _c5_full_model_blocks(model_single, params, h0)
+    T = cfg.T
+    print(f"[C5 full-model, block {shifted_layer} shifted] N=\n{np.round(N, 4)}")
+
+    for t in range(T - 1):
+        assert N[t, t + 1] > 0.1, (
+            f"block {shifted_layer} shifted: N[t={t},t+1] should leak, got {N[t, t+1]:.3e}"
+        )
+    for t in range(T):
+        for s in range(t + 2, T):
+            assert N[t, s] <= ROUNDOFF_ATOL, (
+                f"block {shifted_layer} shifted: unexpected leak at (t={t}, s={s}): {N[t, s]:.3e}"
+            )
+
+
+def test_c5_full_model_mask_fn_wrong_length_list_raises():
+    """Regression guard on the constructor contract (section 3.4): a
+    mask_fn sequence whose length is not exactly cfg.L raises ValueError."""
+    cfg = tiny_config(55)
+    with pytest.raises(ValueError):
+        GPT(cfg, mask_fn=[causal_mask])  # length 1, cfg.L == 2
