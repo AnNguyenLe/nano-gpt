@@ -17,11 +17,33 @@ Forward:
     Y  = _merge_heads(P @ vh)                                         # (B,T,d)
     out, co = self.o.forward(Y, params)
 
+Backward (hand-derived; restated so no one re-derives it differently):
+    dY, g_o   = self.o.backward(d_out, co)
+    dYh       = _split_heads(dY, H)
+    dP        = dYh @ vh.swapaxes(-1,-2)
+    dvh       = P.swapaxes(-1,-2) @ dYh
+    dZ, _     = ops.softmax_backward(dP, {"p": P})   # P * (dP - sum_j dP*P), TL-4 reused
+    dS        = np.where(allowed, dZ, 0.0)           # TL-15: backward never touches -inf
+    dqh       = self.scale * (dS @ kh)               # S = scale * Q K^T  =>  dQ = scale * dS K
+    dkh       = self.scale * (dS.swapaxes(-1,-2) @ qh)   #                     dK = scale * dS^T Q
+    dx_q, g_q = self.q.backward(_merge_heads(dqh), cq)
+    dx_k, g_k = self.k.backward(_merge_heads(dkh), ck)
+    dx_v, g_v = self.v.backward(_merge_heads(dvh), cv)
+    d_x       = dx_q + dx_k + dx_v                   # x fans out to 3 consumers: SUM, never overwrite
+    d_params  = {**g_q, **g_k, **g_v, **g_o}          # exactly the 8 keys
+
+TL-9: attn.k.b has an identically zero true gradient at every T. b_k shifts
+every allowed score in a row by a j-independent constant, and softmax is
+shift-invariant, so out (and hence every downstream loss) does not depend on
+b_k. The analytic backward agrees: db_k = sum_j dk_j, and every row of the
+softmax backward sums to 0, so db_k is 0 up to roundoff. This is NOT a bug;
+see tests/test_attention.py for the TL-9 (a)-(d) gating protocol.
+
 No KV-cache argument, no einsum, no perf work (R21).
 
-Milestone B1 (SPRINT_2_PLAN.md section 6.1): constructor, _split_heads /
-_merge_heads, init_params, forward. The hand-derived backward lands in B3,
-after B2's oracle-match hard gate is committed (S2-07).
+Milestone B3 (SPRINT_2_PLAN.md section 6.1): hand-derived backward + tiny-
+config module gradcheck + the TL-9 protocol, committed strictly after B2's
+oracle-match hard gate (S2-07).
 
 Owner: Engineer B. Files: nanogpt/attention.py, tests/test_attention.py.
 """
@@ -136,3 +158,31 @@ class CausalSelfAttention:
             "allowed": allowed,
         }
         return out, cache
+
+    def backward(self, d_out: np.ndarray, cache: dict):
+        d_out = np.asarray(d_out)
+        check_float64(d_out, names=["d_out"])
+
+        cq, ck, cv, co = cache["cq"], cache["ck"], cache["cv"], cache["co"]
+        qh, kh, vh = cache["qh"], cache["kh"], cache["vh"]
+        P, allowed = cache["P"], cache["allowed"]
+
+        dY, g_o = self.o.backward(d_out, co)
+        dYh = _split_heads(dY, self.H)
+
+        dP = dYh @ vh.swapaxes(-1, -2)
+        dvh = P.swapaxes(-1, -2) @ dYh
+
+        dZ, _ = ops.softmax_backward(dP, {"p": P})
+        dS = np.where(allowed, dZ, 0.0)
+
+        dqh = self.scale * (dS @ kh)
+        dkh = self.scale * (dS.swapaxes(-1, -2) @ qh)
+
+        dx_q, g_q = self.q.backward(_merge_heads(dqh), cq)
+        dx_k, g_k = self.k.backward(_merge_heads(dkh), ck)
+        dx_v, g_v = self.v.backward(_merge_heads(dvh), cv)
+
+        d_x = dx_q + dx_k + dx_v
+        d_params = {**g_q, **g_k, **g_v, **g_o}
+        return d_x, d_params

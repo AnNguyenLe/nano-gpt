@@ -21,16 +21,25 @@ import math
 import numpy as np
 import pytest
 
+from nanogpt import attention
 from nanogpt.attention import CausalSelfAttention, _merge_heads, _split_heads
 from nanogpt.attention_mask import causal_mask, shifted_causal_mask
 from nanogpt.attention_reference import reference_attention_forward
 from nanogpt.config import (
     DEFAULT_SEED,
+    GRADCHECK_TOL,
     INIT_STD,
     N_HEAD,
+    REL_ERR_FLOOR,
     ROUNDOFF_ATOL,
     make_rng,
     tiny_config,
+)
+from nanogpt.gradcheck import gradcheck
+
+_ALL_TENSOR_NAMES = (
+    "attn.q.W", "attn.q.b", "attn.k.W", "attn.k.b",
+    "attn.v.W", "attn.v.b", "attn.o.W", "attn.o.b", "x",
 )
 
 _FIXTURE_SEED = DEFAULT_SEED + 202
@@ -225,3 +234,86 @@ def test_oracle_match_tiny_with_shifted_mask():
     m = _oracle_case(8, 2, 2, 4, seed=_FIXTURE_SEED + 32, mask_fn=shifted_causal_mask)
     print("oracle match tiny, shifted mask, max_abs=", m)
     assert m <= ROUNDOFF_ATOL
+
+
+# ---------------------------------------------------------------------------
+# Module gradcheck (tiny: d=8, H=2, B=2, T=4; non-init fixture; gradcheck
+# default seed). Full 9-row table; TL-9 protocol for attn.k.b. Milestone B3.
+# ---------------------------------------------------------------------------
+def test_module_gradcheck_tiny_full_table():
+    attn, params, x = _tiny_gradcheck_fixture()
+    report = gradcheck(attn.forward, attn.backward, params, x)
+    print(report)
+
+    assert set(report.tensors) == set(_ALL_TENSOR_NAMES)
+    for name, t in report.tensors.items():
+        if name == "attn.k.b":
+            continue  # TL-9: gated separately below, not on the literal rel_err
+        assert t.rel_err < GRADCHECK_TOL, (name, t)
+
+    kb = report.tensors["attn.k.b"]
+    print(f"attn.k.b: rel_err={kb.rel_err:.3e} "
+          f"max_elem_rel_err={kb.max_elem_rel_err:.3e} max_abs_err={kb.max_abs_err:.3e}")
+    assert kb.max_abs_err <= REL_ERR_FLOOR  # TL-9 (b)
+
+
+def test_module_gradcheck_d16_H4_B1_T3():
+    rng = make_rng(_FIXTURE_SEED + 201)
+    d, H, B, T = 16, 4, 1, 3
+    attn = CausalSelfAttention("attn", d, H)
+    params = _non_init_params(rng, d)
+    x = rng.standard_normal((B, T, d)).astype(np.float64)
+
+    report = gradcheck(attn.forward, attn.backward, params, x)
+    print(report)
+    for name, t in report.tensors.items():
+        if name == "attn.k.b":
+            continue
+        assert t.rel_err < GRADCHECK_TOL, (name, t)
+    assert report.tensors["attn.k.b"].max_abs_err <= REL_ERR_FLOOR
+
+
+def test_tl9_kb_structural_zero_protocol(monkeypatch):
+    """TL-9 (a)-(d): attn.k.b's true gradient is identically 0 at every T."""
+    attn, params, x = _tiny_gradcheck_fixture()
+    report = gradcheck(attn.forward, attn.backward, params, x)
+    kb = report.tensors["attn.k.b"]
+
+    rng = make_rng(_FIXTURE_SEED + 102)
+    out, cache = attn.forward(x, params)
+    R = rng.standard_normal(out.shape).astype(np.float64)
+    _, d_params = attn.backward(R, cache)
+
+    # (a) analytic max|db_k| <= ROUNDOFF_ATOL
+    analytic_max = float(np.max(np.abs(d_params["attn.k.b"])))
+    print("TL-9 (a) analytic max|db_k| =", analytic_max)
+    assert analytic_max <= ROUNDOFF_ATOL
+
+    # (b) FD side already below the frozen zero floor
+    print("TL-9 (b) FD max_abs_err(attn.k.b) =", kb.max_abs_err)
+    assert kb.max_abs_err <= REL_ERR_FLOOR
+
+    # (c) invariance anchor: out(b_k + 10*N(0,1)) == out(b_k)
+    delta = 10.0 * rng.standard_normal(params["attn.k.b"].shape).astype(np.float64)
+    params_shifted = dict(params)
+    params_shifted["attn.k.b"] = params["attn.k.b"] + delta
+    out_shifted, _ = attn.forward(x, params_shifted)
+    invariance_max = float(np.max(np.abs(out_shifted - out)))
+    print("TL-9 (c) invariance max|out(b_k+delta) - out(b_k)| =", invariance_max)
+    assert invariance_max <= ROUNDOFF_ATOL
+
+    # (d) test-the-test: the dropped-term softmax backward (dz = p * dp, no
+    # row-sum correction) must be discriminating, i.e. give a materially
+    # non-zero db_k, proving the protocol is not vacuously satisfied.
+    def _dropped_softmax_backward(dp, bwd_cache):
+        p = bwd_cache["p"]
+        return p * dp, {}
+
+    monkeypatch.setattr(attention.ops, "softmax_backward", _dropped_softmax_backward)
+    _, d_params_dropped = attn.backward(R, cache)
+    dropped_max = float(np.max(np.abs(d_params_dropped["attn.k.b"])))
+    print("TL-9 (d) dropped-term max|db_k| =", dropped_max)
+    assert dropped_max > 1e-3  # >> REL_ERR_FLOOR; prototype measured 1.6
+
+    # Still report rel_err and max_elem_rel_err for k.b, per the PO condition.
+    print(f"attn.k.b: rel_err={kb.rel_err:.3e} max_elem_rel_err={kb.max_elem_rel_err:.3e}")
