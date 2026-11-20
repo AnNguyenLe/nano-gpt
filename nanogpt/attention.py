@@ -138,12 +138,12 @@ class CausalSelfAttention:
         kh = _split_heads(k, self.H)
         vh = _split_heads(v, self.H)
 
-        S = (qh @ kh.swapaxes(-1, -2)) * self.scale
+        S = ops.matmul(qh, kh.swapaxes(-1, -2), kind="attention") * self.scale
         allowed = self.mask_fn(T)
         Z = np.where(allowed, S, -np.inf)
         P, _ = ops.softmax_forward(Z)
 
-        Y = _merge_heads(P @ vh)
+        Y = _merge_heads(ops.matmul(P, vh, kind="attention"))
         out, co = self.o.forward(Y, params)
 
         cache = {
@@ -170,14 +170,14 @@ class CausalSelfAttention:
         dY, g_o = self.o.backward(d_out, co)
         dYh = _split_heads(dY, self.H)
 
-        dP = dYh @ vh.swapaxes(-1, -2)
-        dvh = P.swapaxes(-1, -2) @ dYh
+        dP = ops.matmul(dYh, vh.swapaxes(-1, -2), kind="attention")
+        dvh = ops.matmul(P.swapaxes(-1, -2), dYh, kind="attention")
 
         dZ, _ = ops.softmax_backward(dP, {"p": P})
         dS = np.where(allowed, dZ, 0.0)
 
-        dqh = self.scale * (dS @ kh)
-        dkh = self.scale * (dS.swapaxes(-1, -2) @ qh)
+        dqh = self.scale * ops.matmul(dS, kh, kind="attention")
+        dkh = self.scale * ops.matmul(dS.swapaxes(-1, -2), qh, kind="attention")
 
         dx_q, g_q = self.q.backward(_merge_heads(dqh), cq)
         dx_k, g_k = self.k.backward(_merge_heads(dkh), ck)

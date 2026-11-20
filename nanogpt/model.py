@@ -183,7 +183,7 @@ class GPT:
 
         y, c_lnf = self.ln_f.forward(h, params)
         wte_W = params[f"{self.wte.prefix}.W"]
-        logits = y @ wte_W.T  # transient operand; wte_W itself (not .T) is cached
+        logits = ops.matmul(y, wte_W.T)  # transient operand; wte_W itself (not .T) is cached
 
         cache = {"block_caches": block_caches, "c_lnf": c_lnf, "y": y, "wte_W": wte_W}
         return logits, cache
@@ -198,8 +198,8 @@ class GPT:
         V, d = wte_W.shape
         check_float64(d_logits, names=["d_logits"])
 
-        g_out = d_logits.reshape(-1, V).T @ y.reshape(-1, d)  # (V, d)
-        dy = d_logits @ wte_W  # (B, T, d)
+        g_out = ops.matmul(d_logits.reshape(-1, V).T, y.reshape(-1, d))  # (V, d)
+        dy = ops.matmul(d_logits, wte_W)  # (B, T, d)
 
         grads: dict = {}
         dh, g_lnf = self.ln_f.backward(dy, c_fe["c_lnf"])

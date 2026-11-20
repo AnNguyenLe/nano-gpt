@@ -27,6 +27,31 @@ from nanogpt.config import (
 
 
 # --------------------------------------------------------------------------
+# Sprint 4 [B1] (TL-27): single matmul chokepoint.
+#
+# Every production matmul in nanogpt/ goes through this one function, called
+# as ``ops.matmul(...)`` (a module attribute, never imported by name) so that
+# nanogpt.flops.FlopCounter can monkeypatch this single name and see every
+# call. The "ndarray subclass + __array_ufunc__" alternative was prototyped
+# and rejected: LayerNorm.forward and cross_entropy_forward both call
+# np.asarray(...) on their outputs, which silently strips a subclass, so a
+# plain-on-plain matmul downstream (e.g. model.py's g_out = d_logits.T @ y)
+# would go uncounted. An explicit dispatch has no such blind spot.
+# --------------------------------------------------------------------------
+
+def matmul(a, b, *, kind="dense"):
+    """Single chokepoint for every production matmul. kind in {"dense", "attention"}.
+
+    Returns exactly ``a @ b`` (same ufunc, bit-identical). ``kind`` is purely
+    a diagnostic tag for nanogpt.flops.FlopCounter; it never changes the
+    result.
+    """
+    if kind not in ("dense", "attention"):
+        raise ValueError(f"ops.matmul: kind must be 'dense' or 'attention', got {kind!r}")
+    return a @ b
+
+
+# --------------------------------------------------------------------------
 # B1: logsumexp + softmax (first commit -- loss.py depends on this)
 # --------------------------------------------------------------------------
 
@@ -124,7 +149,7 @@ class Linear:
             arrs.append(b)
             names.append(f"{self.prefix}.b")
         check_float64(*arrs, names=names)
-        out = x @ W
+        out = matmul(x, W)
         if self.bias:
             out = out + params[f"{self.prefix}.b"]
         cache = {"x": x, "W": W}
@@ -136,8 +161,8 @@ class Linear:
         check_float64(d_out, names=["d_out"])
         x2 = x.reshape(-1, self.d_in)
         g2 = d_out.reshape(-1, self.d_out)
-        dx = d_out @ W.T
-        dW = x2.T @ g2
+        dx = matmul(d_out, W.T)
+        dW = matmul(x2.T, g2)
         d_params = {f"{self.prefix}.W": dW}
         if self.bias:
             d_params[f"{self.prefix}.b"] = g2.sum(axis=0)
