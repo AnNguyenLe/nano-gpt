@@ -128,3 +128,87 @@ def test_get_batch_on_real_corpus_decodes_to_contiguous_slice(real_ids):
         # y[b] is the same slice shifted by one character.
         expected_y = info.text[start + 1 : start + 1 + T]
         assert tok.decode(y[b]) == expected_y
+
+
+# ===========================================================================
+# [C2] Training loop + CLI smoke tests (tiny config, <= 10 steps, B <= 4)
+# ===========================================================================
+import math  # noqa: E402
+
+from nanogpt.config import INIT_LOSS_TOL, tiny_config  # noqa: E402
+
+
+def _tiny_train(ids, V, steps=5, **kw):
+    cfg = tiny_config(V)
+    kw.setdefault("batch_size", 4)
+    kw.setdefault("lr", 1e-2)
+    kw.setdefault("log_fn", lambda *_a, **_k: None)
+    return cfg, train_module.train(cfg, ids, steps=steps, **kw)
+
+
+def test_train_smoke_completes_with_finite_losses(real_ids):
+    info, tok, ids = real_ids
+    cfg, res = _tiny_train(ids, tok.vocab_size, steps=5)
+    assert len(res.losses) == 5
+    assert len(res.step_times) == 5
+    assert all(math.isfinite(x) for x in res.losses)
+    assert res.wall_time_s > 0.0
+    assert res.init_loss == res.losses[0]
+
+
+def test_train_init_loss_matches_ln_V_through_real_loop(real_ids):
+    # Consistency of the C2 anchor through the real loop (not optimizer evidence).
+    info, tok, ids = real_ids
+    cfg, res = _tiny_train(ids, tok.vocab_size, steps=1)
+    assert abs(res.init_loss - math.log(tok.vocab_size)) < INIT_LOSS_TOL
+
+
+def test_train_changes_every_param_except_attention_k_bias(real_ids):
+    info, tok, ids = real_ids
+    cfg = tiny_config(tok.vocab_size)
+    from nanogpt.model import GPT
+
+    m = GPT(cfg)
+    before = {k: v.copy() for k, v in m.init_params(make_rng(DEFAULT_SEED)).items()}
+    _, res = _tiny_train(ids, tok.vocab_size, steps=5)  # same default seed => same init
+    exempt = {f"h.{l}.attn.k.b" for l in range(cfg.L)}
+    assert exempt <= set(res.params)
+    for k, v0 in before.items():
+        if k in exempt:
+            # TL-9: structurally-zero gradient, so AdamW leaves it ~fixed
+            assert np.max(np.abs(res.params[k] - v0)) <= 1e-6, k
+        else:
+            assert not np.array_equal(res.params[k], v0), k
+
+
+def test_main_runs_tiny_and_prints_step0_and_summary(capsys):
+    rc = train_module.main([
+        "--L", "2", "--d", "8", "--T", "4", "--H", "2", "--allow-out-of-range",
+        "--steps", "3", "--batch-size", "4", "--lr", "0.01", "--log-every", "1",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "step 0 |" in out
+    assert "step-0 loss" in out and "ln V" in out
+    assert "done: 3 steps" in out
+    assert "sha256=7afc055a" in out
+
+
+def test_main_out_of_range_config_without_flag_exits_nonzero():
+    with pytest.raises(SystemExit) as ei:
+        train_module.main(["--L", "2", "--d", "8", "--T", "4", "--H", "2", "--steps", "1"])
+    assert ei.value.code not in (0, None)
+
+
+def test_train_rejects_zero_steps(real_ids):
+    info, tok, ids = real_ids
+    with pytest.raises(ValueError):
+        train_module.train(tiny_config(tok.vocab_size), ids, steps=0, batch_size=2, lr=1e-2)
+
+
+def test_train_profile_steps_logs_a_profile(real_ids):
+    info, tok, ids = real_ids
+    lines = []
+    train_module.train(tiny_config(tok.vocab_size), ids, steps=2, batch_size=2, lr=1e-2,
+                       log_fn=lines.append, profile_steps=2)
+    assert any("cProfile" in s for s in lines)
