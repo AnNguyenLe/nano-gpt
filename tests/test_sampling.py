@@ -373,3 +373,46 @@ def test_bug_temperature_applied_as_multiply_is_caught():
     r = _real_impl()
     failed = _anchor_battery(_bad_temperature_multiplies, r["top_k"], r["sample"])
     assert "temperature_ratio" in failed
+
+# ===========================================================================
+# PO-review additions (independent Sprint 5/6 review)
+# ===========================================================================
+def test_u_zero_with_id_zero_masked_returns_the_lowest_allowed_id_not_a_masked_one():
+    class _Rng:
+        def random(self, size):
+            return np.zeros(size)
+
+    l = np.array([[-9.0, 5.0, -9.0, -9.0, 4.0]])  # top_k=2 keeps ids {1, 4}; id 0 is MASKED
+    assert int(sampling.sample(l, _Rng(), top_k=2)[0]) == 1  # `cdf < u` would return masked id 0
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_nan_and_positive_infinity_logits_raise_instead_of_returning_token_zero(bad):
+    l = np.array([[1.0, bad, 0.0]])
+    for fn in (lambda: sampling.greedy(l), lambda: sampling.apply_temperature(l, 1.0),
+               lambda: sampling.apply_top_k(l, 2), lambda: sampling.probabilities(l),
+               lambda: sampling.sample(l, make_rng(_SEED))):
+        with pytest.raises(ValueError):
+            fn()
+
+
+def test_all_minus_infinity_row_raises_everywhere():
+    l = np.array([[1.0, 2.0], [-np.inf, -np.inf]])
+    for fn in (lambda: sampling.greedy(l), lambda: sampling.probabilities(l),
+               lambda: sampling.sample(l, make_rng(_SEED))):
+        with pytest.raises(ValueError):
+            fn()
+
+
+def test_minus_infinity_entries_remain_legal_when_a_finite_entry_exists():
+    l = np.array([[-np.inf, 1.0, -np.inf]])
+    assert int(sampling.greedy(l)[0]) == 1 and int(sampling.sample(l, make_rng(_SEED))[0]) == 1
+
+
+def test_temperature_so_small_that_division_overflows_raises():
+    l = np.array([[1.0, 2.0, 3.0]])
+    with pytest.raises(ValueError, match="overflow"):
+        sampling.apply_temperature(l, 1e-320)
+    with pytest.raises(ValueError):
+        sampling.sample(l, make_rng(_SEED), temperature=1e-320)
+    sampling.apply_temperature(l, 1e-3)  # a merely small temperature is fine

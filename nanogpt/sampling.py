@@ -25,7 +25,17 @@ def _check_logits(logits) -> np.ndarray:
     check_float64(logits, names=["logits"])
     if logits.ndim < 1 or logits.shape[-1] < 1:
         raise ValueError(f"logits must have a non-empty last axis, got shape {logits.shape}")
+    # -inf is legitimate (a masked entry); NaN and +inf never are, and would otherwise silently
+    # turn into token 0 downstream.
+    if np.any(np.isnan(logits)) or np.any(np.isposinf(logits)):
+        raise ValueError("logits contain NaN or +infinity")
     return logits
+
+
+def _check_has_a_finite_entry(logits: np.ndarray) -> None:
+    """Every row needs at least one finite logit, or the softmax has nothing to normalise."""
+    if not np.all(np.any(np.isfinite(logits), axis=-1)):
+        raise ValueError("a row of logits has no finite entry (all -infinity); nothing can be sampled")
 
 
 def apply_temperature(logits, temperature: float) -> np.ndarray:
@@ -38,12 +48,17 @@ def apply_temperature(logits, temperature: float) -> np.ndarray:
         or temperature <= 0
     ):
         raise ValueError(f"temperature must be a finite number > 0, got {temperature!r}")
-    return logits / float(temperature)
+    with np.errstate(over="ignore"):  # an overflow is detected and reported below, not warned about
+        out = logits / float(temperature)
+    if np.any(np.isfinite(logits) & ~np.isfinite(out)):
+        raise ValueError(f"temperature {temperature!r} is so small that logits / temperature overflows")
+    return out
 
 
 def greedy(logits) -> np.ndarray:
     """argmax over the last axis (ties -> lowest index), as INT_DTYPE ids."""
     logits = _check_logits(logits)
+    _check_has_a_finite_entry(logits)
     return np.argmax(logits, axis=-1).astype(INT_DTYPE)
 
 
@@ -74,6 +89,7 @@ def probabilities(logits, *, temperature: float = 1.0, top_k=None) -> np.ndarray
     z = apply_temperature(logits, temperature)
     if top_k is not None:
         z = apply_top_k(z, top_k)
+    _check_has_a_finite_entry(z)
     p, _ = ops.softmax_forward(z)
     return p
 

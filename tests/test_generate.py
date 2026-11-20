@@ -228,3 +228,13 @@ def test_main_rejects_vocab_mismatch_with_the_checkpoint(tmp_path):
     checkpoint.save(path, m, p)
     with pytest.raises(SystemExit):
         gen.main(["--checkpoint", str(path), "--tokens", "2"])
+
+def test_main_missing_or_corrupt_checkpoint_is_a_clean_error_not_a_traceback(tmp_path, capsys):
+    for name, content in (("missing.ckpt", None), ("garbage.ckpt", b"this is not an npz"), ("empty.ckpt", b"")):
+        path = tmp_path / name
+        if content is not None:
+            path.write_bytes(content)
+        with pytest.raises(SystemExit) as e:
+            gen.main(["--checkpoint", str(path), "--tokens", "3"])
+        assert e.value.code == 2, name
+        assert "cannot load checkpoint" in capsys.readouterr().err, name

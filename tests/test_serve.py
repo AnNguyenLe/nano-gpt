@@ -199,9 +199,16 @@ def test_http_malformed_and_oversized_bodies_get_400(server):
         with pytest.raises(urllib.error.HTTPError) as e:
             _post(url, None, raw=raw)
         assert e.value.code == 400
-    with pytest.raises(urllib.error.HTTPError) as e:
+    # An oversized body may be answered with 400 OR the connection may be reset while the client is
+    # still sending (WinError 10053 on Windows). Both are a rejection; the deterministic, headers-only
+    # version of this check is test_http_body_limit_is_enforced_independently_of_the_prompt_limit.
+    try:
         _post(url, None, raw=b"x" * (serve.MAX_BODY_BYTES + 1))
-    assert e.value.code == 400
+        raise AssertionError("an oversized body was accepted")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    except (ConnectionError, urllib.error.URLError):
+        pass
 
 
 def test_http_unknown_paths_404(server):
@@ -234,3 +241,120 @@ def test_build_state_without_checkpoint_is_untrained_and_with_checkpoint_is_trai
     s1 = serve.build_state(str(path))
     assert s1.trained is True and s1.model.cfg == _CFG
     assert all(np.array_equal(s1.params[k], p[k]) for k in p)
+
+# ---------------------------------------------------------------------------
+# PO-review additions (Sprint 5/6 independent review)
+# ---------------------------------------------------------------------------
+import http.client  # noqa: E402
+import socket  # noqa: E402
+
+
+@pytest.mark.parametrize("field", ["max_new", "top_k", "seed", "temperature"])
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_http_non_finite_numbers_get_400_not_a_dropped_connection(server, field, literal):
+    url, _ = server
+    raw = ('{"prompt":"the ","%s":%s}' % (field, literal)).encode()
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(url, None, raw=raw)
+    assert e.value.code == 400 and "error" in json.loads(e.value.read())
+
+
+def test_parse_rejects_non_finite_numbers_directly(tok):
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        for field in ("max_new", "top_k", "seed", "temperature"):
+            with pytest.raises(serve.RequestError):
+                serve.parse_request({"prompt": "a", field: bad}, _CFG, tok.stoi)
+
+
+def test_http_body_limit_is_enforced_independently_of_the_prompt_limit(server):
+    # Headers only: declares an oversized body but never sends it, so there is no reset race, and
+    # no prompt-length check can mask the body-size check.
+    url, _ = server
+    host, port = url.replace("http://", "").split(":")
+    s = socket.create_connection((host, int(port)), timeout=10)
+    s.sendall(("POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+               "Content-Length: %d\r\n\r\n" % (serve.MAX_BODY_BYTES + 1)).encode())
+    reply = s.recv(4096).decode()
+    s.close()
+    assert reply.startswith("HTTP/1.") and " 400 " in reply.split("\r\n")[0]
+
+
+def test_http_requires_json_content_type_so_cross_site_forms_cannot_trigger_generation(server):
+    url, _ = server
+    for ctype in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data", None):
+        headers = {} if ctype is None else {"Content-Type": ctype}
+        req = urllib.request.Request(url + "/api/generate", data=b'{"prompt":"rain","max_new":3}', headers=headers)
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=10)
+        assert e.value.code == 415, ctype
+    # and the JSON content type (with a charset parameter) still works
+    req = urllib.request.Request(url + "/api/generate", data=b'{"prompt":"rain","max_new":3,"seed":1}',
+                                 headers={"Content-Type": "application/json; charset=utf-8"})
+    assert json.loads(urllib.request.urlopen(req, timeout=20).read().decode().splitlines()[-1])["done"]
+
+
+@pytest.mark.parametrize("host", ["evil.example.com", "evil.example.com:8000", "127.0.0.1.evil.com", "", "10.0.0.5"])
+def test_http_rejects_foreign_host_headers_dns_rebinding_guard(server, host):
+    url, _ = server
+    h, port = url.replace("http://", "").split(":")
+    conn = http.client.HTTPConnection(h, int(port), timeout=10)
+    conn.putrequest("GET", "/api/info", skip_host=True)
+    if host:
+        conn.putheader("Host", host)
+    conn.endheaders()
+    resp = conn.getresponse()
+    assert resp.status == 403
+    conn.close()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.1:8000", "localhost", "localhost:9", "LOCALHOST", "[::1]", "[::1]:8000"])
+def test_host_is_allowed_accepts_loopback_names(host):
+    assert serve.host_is_allowed(host, serve.LOOPBACK_HOSTS)
+
+
+@pytest.mark.parametrize("host", [None, "", "evil.com", "127.0.0.1.evil.com", "localhost.evil.com:80", "0.0.0.0"])
+def test_host_is_allowed_rejects_everything_else(host):
+    assert not serve.host_is_allowed(host, serve.LOOPBACK_HOSTS)
+
+
+def test_host_check_is_off_only_for_a_deliberately_non_loopback_bind():
+    assert serve.host_is_allowed("anything.example", None)
+
+
+@pytest.mark.parametrize("path", [
+    "/serve.py", "/README.md", "/GUIDE.md", "/web/index.html", "/nanogpt/config.py",
+    "/tests/test_serve.py", "/../serve.py", "/web/../serve.py", "/%2e%2e/serve.py", "/.git/config",
+])
+def test_http_never_serves_files_that_exist_on_disk(server, path):
+    # Probes paths that REALLY EXIST (a handler that served the project root would return 200 here).
+    url, _ = server
+    h, port = url.replace("http://", "").split(":")
+    conn = http.client.HTTPConnection(h, int(port), timeout=10)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    assert resp.status == 404, (path, resp.status)
+    assert b"import" not in body and b"def " not in body
+    conn.close()
+
+
+def test_concurrent_requests_all_succeed_and_match_their_sequential_results(server):
+    url, state = server
+    seeds = list(range(100, 108))
+    sequential = {s: [m["token"] for m in _lines(_post(url, {"prompt": "rain", "max_new": 6, "seed": s})) if "token" in m]
+                  for s in seeds}
+    results, errors = {}, []
+
+    def work(s):
+        try:
+            results[s] = [m["token"] for m in _lines(_post(url, {"prompt": "rain", "max_new": 6, "seed": s})) if "token" in m]
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=work, args=(s,)) for s in seeds]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors and results == sequential
+    assert not state.lock.locked()  # the generation lock is always released

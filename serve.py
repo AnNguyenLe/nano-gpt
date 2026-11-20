@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,9 @@ def parse_request(body: dict, cfg: ModelConfig, stoi: dict) -> dict:
         v = body.get(name, default)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise RequestError(f"{name} must be a number")
+        # json.loads accepts NaN / Infinity / 1e999: reject them BEFORE int() would raise
+        if isinstance(v, float) and not math.isfinite(v):
+            raise RequestError(f"{name} must be a finite number")
         if integer and int(v) != v:
             raise RequestError(f"{name} must be an integer")
         if not (lo <= v <= hi):
@@ -159,7 +163,25 @@ class ChatState:
         }
 
 
-def make_handler(state: ChatState):
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def host_is_allowed(host_header, allowed) -> bool:
+    """DNS-rebinding guard: when bound to loopback, only loopback Host names are served.
+    ``allowed`` is None when the user deliberately bound a non-loopback address."""
+    if allowed is None:
+        return True
+    if not host_header:
+        return False
+    name = host_header.strip().lower()
+    if name.startswith("["):
+        name = name.split("]", 1)[0] + "]"
+    else:
+        name = name.rsplit(":", 1)[0] if ":" in name else name
+    return name in allowed
+
+
+def make_handler(state: ChatState, allowed_hosts=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "nanogpt-numpy"
 
@@ -167,17 +189,22 @@ def make_handler(state: ChatState):
             pass
 
         def _send(self, code, body: bytes, ctype: str):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # client left before we could answer; nothing useful to do
 
         def _json(self, code, obj):
             self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
 
         def do_GET(self):
+            if not host_is_allowed(self.headers.get("Host"), allowed_hosts):
+                return self._json(403, {"error": "forbidden host"})
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
                 try:
@@ -190,8 +217,15 @@ def make_handler(state: ChatState):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if not host_is_allowed(self.headers.get("Host"), allowed_hosts):
+                return self._json(403, {"error": "forbidden host"})
             if self.path.split("?", 1)[0] != "/api/generate":
                 return self._json(404, {"error": "not found"})
+            # A cross-site page can only send "simple" content types without a CORS preflight, which
+            # this server never answers. Requiring application/json therefore blocks cross-site POSTs.
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                return self._json(415, {"error": "Content-Type must be application/json"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -239,7 +273,10 @@ def make_handler(state: ChatState):
 def build_state(checkpoint_path: str | None, *, random_init_seed: int = DEFAULT_SEED) -> ChatState:
     _, tok = load_corpus_and_tokenizer()
     if checkpoint_path and Path(checkpoint_path).exists():
-        cfg, params, _ = checkpoint.load(checkpoint_path)
+        try:
+            cfg, params, _ = checkpoint.load(checkpoint_path)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"cannot load checkpoint {str(checkpoint_path)!r}: {e}")
         if cfg.V != tok.vocab_size:
             raise SystemExit(f"checkpoint vocab {cfg.V} does not match the corpus tokenizer {tok.vocab_size}")
         return ChatState(GPT(cfg), params, tok, source=str(checkpoint_path), trained=True)
@@ -250,7 +287,8 @@ def build_state(checkpoint_path: str | None, *, random_init_seed: int = DEFAULT_
 
 
 def make_server(state: ChatState, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(state))
+    allowed = LOOPBACK_HOSTS if host in ("127.0.0.1", "localhost", "::1") else None
+    return ThreadingHTTPServer((host, port), make_handler(state, allowed))
 
 
 def main(argv=None) -> int:

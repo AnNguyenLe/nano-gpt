@@ -140,6 +140,11 @@ accumulated with `+=`, which is what makes the weight-tying check hold by constr
   integer-exact matmul inventory and the attention-heavy configs do. The tests say so explicitly.
 - A KV-cache that ignores its mask row is indistinguishable from a correct one under the causal
   mask, so C8 cannot detect that bug today.
+- C8's absolute 1e-10 bound has real margin only for moderate weights. An independent review found
+  that with very large weights (logits around 65) cached-vs-full differences reach 2e-10. That is
+  floating-point roundoff, not a cache bug: re-running the plain full forward after a 1-ulp change
+  to one input parameter moves the same logits by 1e-10 to 5e-10. At the trained model's logit scale
+  (about 3 to 14) the measured differences are 1e-15 to 3e-13.
 - The decision to exclude `wpe.W` from weight decay (matching minGPT, unlike nanoGPT) is a recorded
   reading of "weight matrices" and has not been independently ratified.
 - The optional GPT-2-small weight-loading bonus (Phase 7) is **not implemented**: it is the only

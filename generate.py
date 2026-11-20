@@ -94,7 +94,10 @@ def main(argv=None) -> int:
     V = tok.vocab_size
 
     if args.checkpoint:
-        cfg, params, _ = checkpoint.load(args.checkpoint)
+        try:
+            cfg, params, _ = checkpoint.load(args.checkpoint)
+        except (OSError, ValueError) as e:  # missing file, not an .npz, or a rejected checkpoint
+            ap.error(f"cannot load checkpoint {args.checkpoint!r}: {e}")
         model = GPT(cfg)
     else:
         try:

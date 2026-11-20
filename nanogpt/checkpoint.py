@@ -19,15 +19,30 @@ The weight tie is restored by construction: ``params`` has exactly
 """
 from __future__ import annotations
 
+import zipfile
+
 import numpy as np
 
-from nanogpt.config import DTYPE, ModelConfig
+from nanogpt.config import DTYPE, ModelConfig, make_rng
 from nanogpt.model import GPT
 from nanogpt.optim import AdamW
 
 FORMAT = "nanogpt-numpy-ckpt-v1"
 _CFG_FIELDS = ("V", "T", "d", "L", "H")
 _OPT_SCALARS = ("t", "lr", "beta1", "beta2", "eps", "weight_decay")
+
+
+def _read_array(z, name: str, shape: tuple) -> np.ndarray:
+    """Read one array and refuse anything that is not exactly what the model needs: float64 on disk
+    (no silent float32 / int coercion), the exact shape (no silent broadcasting later), all finite."""
+    raw = z[name]
+    if raw.dtype != DTYPE:
+        raise ValueError(f"checkpoint.load: {name} has dtype {raw.dtype}, expected {np.dtype(DTYPE)}")
+    if raw.shape != tuple(shape):
+        raise ValueError(f"checkpoint.load: {name} has shape {raw.shape}, expected {tuple(shape)}")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"checkpoint.load: {name} contains NaN or infinity")
+    return np.array(raw, dtype=DTYPE, order="C", copy=True)
 
 
 def save(path, model: GPT, params: dict, opt: AdamW = None) -> None:
@@ -70,8 +85,13 @@ def save(path, model: GPT, params: dict, opt: AdamW = None) -> None:
 
 
 def load(path):
-    """Return ``(cfg, params, opt_state_or_None)``. Never unpickles anything."""
-    with np.load(path, allow_pickle=False) as z:
+    """Return ``(cfg, params, opt_state_or_None)``. Never unpickles anything. Every way a file can be
+    unreadable (missing, empty, truncated, not an npz) surfaces as OSError or ValueError."""
+    try:
+        z_ctx = np.load(path, allow_pickle=False)
+    except (EOFError, zipfile.BadZipFile) as e:
+        raise ValueError(f"checkpoint.load: {path!s} is not a readable checkpoint ({type(e).__name__}: {e})") from None
+    with z_ctx as z:
         files = set(z.files)
         if "format" not in files or str(z["format"]) != FORMAT:
             got = str(z["format"]) if "format" in files else None
@@ -90,10 +110,10 @@ def load(path):
                 f"checkpoint.load: param keys mismatch; missing={sorted(set(want) - have)}, "
                 f"extra={sorted(have - set(want))}"
             )
+        want_shapes = {k: v.shape for k, v in GPT(cfg).init_params(make_rng(0)).items()}
         params = {}
         for k in want:
-            a = np.array(z[f"param/{k}"], dtype=DTYPE, order="C", copy=True)
-            params[k] = a
+            params[k] = _read_array(z, f"param/{k}", want_shapes[k])
 
         opt_state = None
         if any(f.startswith("opt_") for f in files):
@@ -106,12 +126,12 @@ def load(path):
                     name = f"opt_{tag}/{k}"
                     if name not in files:
                         raise ValueError(f"checkpoint.load: missing {name}")
-                    arr = np.array(z[name], dtype=DTYPE, order="C", copy=True)
-                    if arr.shape != params[k].shape:
-                        raise ValueError(f"checkpoint.load: {name} has shape {arr.shape}, expected {params[k].shape}")
-                    dst[k] = arr
+                    dst[k] = _read_array(z, name, params[k].shape)
+            opt_t = int(z["opt_t"])
+            if opt_t < 0:
+                raise ValueError(f"checkpoint.load: opt_t must be >= 0, got {opt_t}")
             opt_state = {
-                "t": int(z["opt_t"]),
+                "t": opt_t,
                 "lr": float(z["opt_lr"]),
                 "betas": (float(z["opt_beta1"]), float(z["opt_beta2"])),
                 "eps": float(z["opt_eps"]),

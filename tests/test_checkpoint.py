@@ -248,3 +248,76 @@ def test_save_writes_exactly_the_given_path_no_extension_appended(tmp_path):
     checkpoint.save(target, m, p)
     assert target.exists() and not (tmp_path / "model.ckpt.npz").exists()
     assert checkpoint.load(target)[0] == cfg
+
+# ===========================================================================
+# PO-review additions: a params-only checkpoint must be validated too
+# ===========================================================================
+def _saved(tmp_path, with_opt=False):
+    cfg, m, p, idx, tgt = _setup()
+    opt = None
+    if with_opt:
+        opt = AdamW(p, lr=1e-2)
+        _train(m, p, opt, idx, tgt, 1)
+    checkpoint.save(tmp_path / "a.npz", m, p, opt)
+    return tmp_path / "a.npz"
+
+
+@pytest.mark.parametrize("key,shape", [
+    ("param/h.0.attn.q.b", (1,)),
+    ("param/ln_f.gamma", (1,)),
+    ("param/h.0.mlp.fc.W", (24, 1)),
+    ("param/wpe.W", (3, 8)),
+    ("param/wte.W", (11, 9)),
+])
+def test_load_rejects_wrong_param_shapes_even_without_optimizer_state(tmp_path, key, shape):
+    path = _saved(tmp_path)
+    _rewrite(path, tmp_path / "bad.npz", lambda d: d.update({key: np.zeros(shape)}))
+    with pytest.raises(ValueError, match="shape"):
+        checkpoint.load(tmp_path / "bad.npz")
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.int64, np.float16])
+def test_load_rejects_non_float64_params_instead_of_silently_coercing(tmp_path, dtype):
+    path = _saved(tmp_path)
+
+    def mutate(d):
+        d["param/wte.W"] = d["param/wte.W"].astype(dtype)
+
+    _rewrite(path, tmp_path / "bad.npz", mutate)
+    with pytest.raises(ValueError, match="dtype"):
+        checkpoint.load(tmp_path / "bad.npz")
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_load_rejects_non_finite_params_and_optimizer_state(tmp_path, bad):
+    path = _saved(tmp_path, with_opt=True)
+
+    def poison_param(d):
+        a = d["param/wpe.W"].copy()
+        a[0, 0] = bad
+        d["param/wpe.W"] = a
+
+    def poison_state(d):
+        a = d["opt_m/wpe.W"].copy()
+        a[0, 0] = bad
+        d["opt_m/wpe.W"] = a
+
+    _rewrite(path, tmp_path / "p.npz", poison_param)
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        checkpoint.load(tmp_path / "p.npz")
+    _rewrite(path, tmp_path / "s.npz", poison_state)
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        checkpoint.load(tmp_path / "s.npz")
+
+
+def test_load_rejects_negative_step_count(tmp_path):
+    path = _saved(tmp_path, with_opt=True)
+    _rewrite(path, tmp_path / "bad.npz", lambda d: d.update({"opt_t": np.array(-3, dtype=np.int64)}))
+    with pytest.raises(ValueError, match="opt_t"):
+        checkpoint.load(tmp_path / "bad.npz")
+
+
+def test_load_still_accepts_a_valid_checkpoint_after_hardening(tmp_path):
+    path = _saved(tmp_path, with_opt=True)
+    cfg, params, st = checkpoint.load(path)
+    assert st["t"] == 1 and set(params) == set(GPT(cfg).param_keys())

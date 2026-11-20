@@ -212,6 +212,13 @@ def _model(cfg, seed_off=0):
         if not (k.endswith(".gamma") or k.endswith(".beta")):
             p[k] += 0.3 * rng.standard_normal(p[k].shape) if k != "wte.W" else 0.0
     p["wte.W"] += 0.3 * rng.standard_normal(p["wte.W"].shape)
+    # PO review: with gamma=1, beta=0 every LayerNorm is the identity affine, so ln1/ln2/ln_f were
+    # interchangeable and a cached path that used the wrong one went unnoticed. Randomise them.
+    for k in m.param_keys():
+        if k.endswith(".gamma"):
+            p[k] = 1.0 + 0.4 * rng.standard_normal(p[k].shape)
+        elif k.endswith(".beta"):
+            p[k] = 0.3 * rng.standard_normal(p[k].shape)
     return m, p
 
 
@@ -526,3 +533,36 @@ def test_incremental_decoding_costs_strictly_fewer_flops_than_recomputing(name):
     assert 0 < cached_fc.total() < uncached
     print(f"{name}: cached={cached_fc.total()} uncached={uncached} "
           f"ratio={uncached / cached_fc.total():.2f}x over {n} tokens")
+
+def test_cached_path_distinguishes_ln1_ln2_and_ln_f_because_their_affines_differ():
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    for l in range(cfg.L):
+        assert not np.allclose(p[f"h.{l}.ln1.gamma"], p[f"h.{l}.ln2.gamma"])
+        assert not np.allclose(p[f"h.{l}.ln1.beta"], p[f"h.{l}.ln2.beta"])
+    assert not np.allclose(p["ln_f.gamma"], 1.0) and not np.allclose(p["ln_f.beta"], 0.0)
+
+
+def test_block_forward_step_using_ln1_in_place_of_ln2_is_caught():
+    # Mutant from the independent PO review: the second LayerNorm of the cached block is ln1.
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    idx = make_rng(_SEED + 340).integers(0, cfg.V, size=(1, cfg.T))
+    full, _ = m.forward(idx, p)
+    real = Block.forward_step
+
+    def wrong(self, x_step, params, kv=None, layer=0):
+        u1, _ = self.ln1.forward(x_step, params)
+        a = self.attn.forward_step(u1, params, kv, layer)
+        x1 = x_step + a
+        u2, _ = self.ln1.forward(x1, params)  # BUG: ln1 instead of ln2
+        mm, _ = self.mlp.forward(u2, params)
+        return x1 + mm
+
+    Block.forward_step = wrong
+    try:
+        kv = KVCache(cfg, 1)
+        bad = np.concatenate([m.forward_step(idx[:, t : t + 1], p, kv) for t in range(cfg.T)], axis=1)
+    finally:
+        Block.forward_step = real
+    assert np.max(np.abs(bad - full)) > 1e-3
