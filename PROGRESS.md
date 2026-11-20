@@ -943,3 +943,93 @@ case was removed, and two tests were added. Shipped as `TL fixup` `33fccd6`.
 - Suite ~22-28 s of the 60 s budget.
 
 **Next: Phase 6 — Numerical stability (large-logit, full model), then Phase 8 wrap-up.**
+
+---
+
+## Phase 6 - Numerical Stability (large logits, full model)  [DONE 2026-11-20]
+
+Single commit (Engineer C identity): `tests/test_numerical_stability.py`, 16 tests, ~0.6 s. No
+production code changed: stable log-sum-exp softmax / cross-entropy were built in Sprint 1.
+
+- Fixture scales the tied embedding in place so max |logit| ~ 1e3 (asserted 5e2 < max < 2e3), keeping
+  the tie and contiguity. **Discriminator:** the naive `exp(z)/sum(exp(z))` is asserted NOT finite on
+  these exact logits, while `ops.softmax_forward` is finite and sums to 1.
+- Full-model loss is finite and equals an independent pure-Python `math.fsum` log-sum-exp reference
+  (rel 1e-9); a closed-form row `[1000, 0, 0]` gives `1000 + log1p(2e^-1000)`.
+- Cross-entropy gradient at 1e3 scale: finite, rows sum to 0 (<= 1e-12), and matches central
+  differences (FD_STEP) to 1e-6. Every full-model gradient is finite at 1e3 and across a sweep
+  1e2, 1e3, 1e4, 1e5, and at the default config. The tie holds and `wte.W` is one accumulated array.
+- Sampling probabilities finite at t = 1e-3, 1, 1e3, 1e6; with a 1e3 margin sampling equals greedy.
+- Cached decoding at 1e3 logits agrees with the full forward to 1e-10 **relative** to the logit
+  scale. (C8 itself remains the spec's **absolute** 1e-10 claim at the specified init scale; at 1e3
+  one ulp of a logit is ~1e-13, so relative is the meaningful invariant here and the test says so.)
+- **Mutants, run and reverted (`ops.py` restored, `git status` clean):** (1) softmax without the
+  max-subtraction -> 2 tests fail (the discriminator and the sampling pipeline); (2) log-sum-exp
+  with the shift forced to 0 -> **7 tests fail** (loss reference, closed form, CE FD, the scale
+  sweep at 1e3/1e4/1e5, default config).
+- **T=1 and the shifted mask, re-confirmed on trained parameters (5 real AdamW steps), not re-derived:**
+  T=1 gives finite loss/gradients with **exactly zero** `q.W/q.b/k.W/k.b` gradients while `v.W` is not
+  degenerate. Shifted mask leaks and causal does not.
+- **A wrong expectation caught while writing it (my test, not a code defect):** I first asserted that
+  a change at position 2 could not reach position 0 under the shifted mask. It does, with L=2: the
+  `j <= i+1` leak **compounds per attention layer**, so the shifted mask reaches `s <= i + L`. The
+  existing Sprint 3 test (`test_c5_full_model_shifted_mask_all_blocks_fails_and_leak_reaches_t_plus_L`)
+  already encodes this; the new test now asserts the correct reach (position 0 safe from s=3, positions
+  1 and 2 affected).
+
+Suite after Phase 6: **681 passed**, ~22 s.
+
+---
+
+## Phase 8 - Wrap-up  [DONE 2026-11-20]
+
+- `README.md` rewritten: setup, the one verify command, train, generate, the **C1-C9 -> test file**
+  map (checked against the actual test names, e.g. full-model C5 lives in `test_causal_mask.py`), the
+  other guarantees, and an honest-caveats section.
+- `run_checks.py`: one command that writes `test_log.txt` with Python/NumPy/SciPy versions, corpus
+  source + SHA-256, vocabulary size, the full `pytest` output and the exit status. Committed log:
+  **681 passed in 23.6 s, exit status 0**, corpus sha256 `7afc055a...2854`, V = 55.
+- **Clean-checkout reproduction (TL):** `git archive` of HEAD into an empty directory, then
+  `run_checks.py` -> 681 passed; `train.py --steps 20 --save` -> `generate.py --checkpoint` ran
+  end to end. No network was used.
+- Static: all `*.py` and `*.md` decode as strict UTF-8 with no U+FFFD; no `TODO(SPRINT`; no
+  torch/jax/tensorflow/autograd; `np.load` only with `allow_pickle=False`; no `lm_head` key anywhere.
+
+### Definition of Done (nanoGPT_execution_plan.md section 7), item by item
+
+| Item | State | Evidence |
+|---|---|---|
+| C1-C9 pass as automated tests | **Yes** | 681 tests; map in README; C8 = 1e-10 absolute, measured 8.9e-16 / 3.3e-14 / 2.6e-13 |
+| Four edge cases covered and discriminating | **Yes** | large logits (naive overflows, 2 mutants caught); eps>0 rank d-1 (S1); T=1 exact-zero Q/K grads (S2, re-confirmed trained); shifted mask fails C5 (S2/S3, re-confirmed trained) |
+| Training <= 30 min CPU, no network | **Yes** | 4000 steps = 841 s (14.0 min); no network code path exists (Phase 7 not built) |
+| Corpus resolved before Phase 1 | **Yes** | synthetic-v1, seed 1337, V=55, documented in Phase 0 |
+| `config.py` single source of truth | **Yes, with one disclosed gap** | `test_conventions.py` guards `nanogpt/*.py`; root-level `train.py`/`generate.py`/`run_checks.py` are outside the scan and rely on import discipline |
+| FLOP counter instrumented, +-25% band | **Yes** | single `ops.matmul` chokepoint (AST-guarded); equals the exact integer inventory; band + attention-heavy discriminators |
+| AdamW vs closed-form anchor | **Yes** | first step, 3-step table, independent 60-digit Decimal reference 7.8e-16; four bug variants caught |
+| `pytest tests/` single command | **Yes** | one command, 681 tests, ~24 s; `run_checks.py` wraps it with a log |
+| README: train, generate, verify | **Yes** | README.md; clean-checkout run reproduced |
+| PROGRESS.md current for every phase | **Yes** | Phases 0-6 and 8 here; Phase 7 recorded below |
+| No torch/jax/tf/autograd | **Yes** | guarded in `nanogpt/`, grep clean in root scripts |
+
+**Phase 7 (optional bonus, GPT-2-small weights): NOT implemented, by decision.** It is the only
+networked phase and the model is far outside this project's size ranges (T=1024, d=768, L=12 vs
+T 64-128, d 64-128, L 2-4; float64 weights ~1 GB). C1 already reproduces GPT-2-small's 124,439,808
+parameters analytically. The execution plan marks Phase 7 optional, and "no network calls outside
+the optional bonus path" holds trivially.
+
+### What remains open (not hidden)
+
+1. **No PO pass was ever run for Sprints 4 or 5**, and **TL-24 (`wpe.W` excluded from weight decay)
+   is unratified.** The execution plan reserves an independent high-effort PO pass for the final
+   gate; it has not happened. Sprints 1-3 were accepted by a PO; Sprints 4-6 and 8 were signed off by
+   TL re-measurement only. This is the single largest gap between "all checks pass" and "independently
+   accepted".
+2. Sprint 4's last five milestones and all of Sprint 5/6/8 were written by one agent under the role
+   identities the plans assign (D-S4-1, D-S5-2), not by separate agents.
+3. Known, intentional limits recorded in tests: `attn.k.b` has an identically zero gradient (TL-9); a
+   cache that ignores its mask row is indistinguishable under `causal_mask`, so C8 cannot detect it;
+   the +-25% band alone does not discriminate the naive 2N formula at the default config.
+4. The real training run is outside pytest by design (14 minutes); the suite itself runs in ~24 s.
+
+**Project status: all correctness requirements C1-C9 pass as automated tests; Phase 7 deliberately
+skipped; independent PO acceptance of Sprints 4-6 outstanding.**
