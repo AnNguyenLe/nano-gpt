@@ -60,7 +60,25 @@ L 2-4, d 64-128, T 64-128; anything else needs `--allow-out-of-range`), `--profi
 first N steps), `--save PATH` (write params + AdamW state). The step-0 loss is printed next to
 ln V as a consistency check only.
 
-## Generate
+## Chat UI (browser)
+
+```
+.venv\Scripts\python.exe -u train.py --save model.ckpt     # once, ~14 min
+.venv\Scripts\python.exe serve.py                          # then open http://127.0.0.1:8000
+```
+
+`serve.py` is a small local web server (standard library only, no new dependencies, bound to
+127.0.0.1) with a ChatGPT-style page: streaming output, sliders for max new characters,
+temperature and top-k, a greedy switch, and a seed box (the seed used is shown under each reply so a
+run can be reproduced). It loads `model.ckpt` if it exists; otherwise it serves untrained weights and
+shows a warning banner. Options: `--checkpoint PATH --port N`.
+
+Set expectations: this is **not an assistant**. It is a tiny character-level model that *continues
+your text*; it will not answer questions or follow instructions. Its context is 64 characters, so
+your prompt is cut to the last `64 - max_new` characters (the UI tells you when that happens), and it
+only knows the 55 characters of its training corpus (unknown characters are ignored and listed).
+
+## Generate (command line)
 
 ```
 .venv\Scripts\python.exe generate.py --checkpoint model.ckpt --prompt "the " --tokens 100 --top-k 8 --temperature 0.8
@@ -96,6 +114,7 @@ Other guarantees and where they live:
 | Frozen conventions (dtype, eps, init std, FD step, rel-err) defined once in `nanogpt/config.py`; no stray literals, no float32, no framework imports | `tests/test_conventions.py` |
 | Single matmul chokepoint (`ops.matmul`) so the FLOP counter cannot miss a product | `tests/test_flops.py` |
 | Sampling, checkpoint round trip (bit-identical resume), generation | `tests/test_sampling.py`, `tests/test_checkpoint.py`, `tests/test_generate.py` |
+| Chat UI server: request validation, streaming equals `generate()`, real HTTP round trip | `tests/test_serve.py` |
 | Training loop determinism, tie preservation, no loss-decrease assertion anywhere | `tests/test_train.py` |
 
 ## Layout
@@ -103,7 +122,7 @@ Other guarantees and where they live:
 ```
 nanogpt/   config  tokenizer  gradcheck  ops  layernorm  attention  attention_reference  attention_mask
            mlp  block  model  loss  optim  flops  param_count  kv_cache  sampling  checkpoint
-train.py   generate.py   run_checks.py   conftest.py   data/   tests/
+train.py   generate.py   serve.py   run_checks.py   conftest.py   web/   data/   tests/
 ```
 
 Every differentiable module follows `forward(x, params) -> (out, cache)` and
