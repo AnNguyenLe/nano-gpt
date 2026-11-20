@@ -311,3 +311,232 @@ def test_decoupled_decay_zero_gradient_geometric_decay():
         assert np.all(opt.state[DECAY_KEY]["v"] == 0.0)
         expected = expected * (1.0 - ETA * LAMBDA)
         np.testing.assert_allclose(opt.params[DECAY_KEY], expected, atol=ROUNDOFF_ATOL, rtol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# A3: tied single optimizer state (PO P0 dedicated test)
+# ---------------------------------------------------------------------------
+from nanogpt.config import ADAMW_BETAS, ADAMW_WEIGHT_DECAY, DEFAULT_SEED, make_rng  # noqa: E402
+
+_A3_SEED = DEFAULT_SEED + 401  # per-file fixture offset (never DEFAULT_SEED itself)
+_A3_LR = 0.01
+
+
+def _tiny_model_batch(V=11):
+    cfg = tiny_config(V=V)
+    model = GPT(cfg)
+    params = model.init_params(make_rng(_A3_SEED))
+    rng = make_rng(_A3_SEED + 1)
+    idx = rng.integers(0, V, size=(2, cfg.T))
+    tgt = rng.integers(0, V, size=(2, cfg.T))
+    loss, cache = model.forward_loss(idx, tgt, params)
+    _, grads = model.backward_loss(1.0, cache)
+    return model, params, grads
+
+
+def test_tied_single_state_on_real_model():
+    model, p, grads = _tiny_model_batch()
+    wte_obj = p["wte.W"]
+    wte0 = wte_obj.copy()
+    named = model.named_parameters(p)
+    assert named["lm_head.W"] is p["wte.W"]
+
+    opt = optim.AdamW(named, lr=_A3_LR)
+    assert len(opt.state) == len(model.param_keys())
+    assert "lm_head.W" not in opt.state
+    assert "lm_head.W" not in opt.params
+    assert opt.params["wte.W"] is p["wte.W"]
+
+    opt.step(grads)
+
+    b1, b2 = ADAMW_BETAS
+    g = grads["wte.W"]
+    # one accumulation (not two): m == (1 - b1) * g exactly once
+    np.testing.assert_allclose(opt.state["wte.W"]["m"], (1 - b1) * g, atol=ROUNDOFF_ATOL, rtol=0.0)
+    np.testing.assert_allclose(opt.state["wte.W"]["v"], (1 - b2) * g * g, atol=ROUNDOFF_ATOL, rtol=0.0)
+
+    # wte.W is no-decay: single-step closed form is -lr * g / (|g| + eps)
+    expected = wte0 - _A3_LR * g / (np.abs(g) + ADAMW_EPS)
+    np.testing.assert_allclose(p["wte.W"], expected, atol=ROUNDOFF_ATOL, rtol=0.0)
+
+    assert p["wte.W"] is wte_obj
+    assert model.named_parameters(p)["lm_head.W"] is p["wte.W"]
+    assert p["wte.W"].flags["C_CONTIGUOUS"]
+    assert opt.t == 1
+
+
+def test_tied_two_state_adversary_moves_wte_about_twice_as_far():
+    model, p_real, grads = _tiny_model_batch()
+    wte0 = p_real["wte.W"].copy()
+
+    # real optimizer
+    opt = optim.AdamW(model.named_parameters(p_real), lr=_A3_LR)
+    opt.step(grads)
+    real_delta = p_real["wte.W"] - wte0
+
+    # test-local adversary: one (m, v) per named_parameters() key => two
+    # states and two updates of the SAME array.
+    p_bad = {k: v.copy() for k, v in p_real.items()}
+    p_bad["wte.W"] = wte0.copy()
+    named_bad = model.named_parameters(p_bad)
+    b1, b2 = ADAMW_BETAS
+    g = grads["wte.W"]
+    for key in ("wte.W", "lm_head.W"):
+        arr = named_bad[key]
+        m = (1 - b1) * g
+        v = (1 - b2) * g * g
+        arr -= _A3_LR * (m / (1 - b1)) / (np.sqrt(v / (1 - b2)) + ADAMW_EPS)
+    bad_delta = p_bad["wte.W"] - wte0
+
+    assert np.linalg.norm(bad_delta - real_delta) > 1e-3 * _A3_LR
+    # ... and specifically about 2x the real move
+    ratio = np.linalg.norm(bad_delta) / np.linalg.norm(real_delta)
+    assert 1.9 < ratio < 2.1
+
+
+def test_step_rejects_lm_head_alias_in_grads():
+    model, p, grads = _tiny_model_batch()
+    opt = optim.AdamW(model.named_parameters(p), lr=_A3_LR)
+    with pytest.raises(ValueError):
+        opt.step({**grads, "lm_head.W": grads["wte.W"]})
+    assert opt.t == 0  # failed validation must not advance the counter
+
+
+def test_adamw_default_config_single_state():
+    from nanogpt.config import ModelConfig
+
+    model = GPT(ModelConfig(V=55))
+    p = model.init_params(make_rng(_A3_SEED))
+    opt = optim.AdamW(model.named_parameters(p), lr=_A3_LR)
+    assert len(opt.state) == len(model.param_keys()) == 4 + 16 * 2
+    assert "lm_head.W" not in opt.state
+
+
+# ---------------------------------------------------------------------------
+# A3: test-the-tests -- each buggy variant must MISS the section 3.2 tables
+# ---------------------------------------------------------------------------
+def _ref_run(variant, theta0, steps=3, decay=True):
+    """Test-local scalar-loop AdamW with an injectable bug. 'correct' is the
+    spec and must reproduce the tables; the others must not."""
+    b1, b2 = BETAS_ANCHOR
+    m = np.zeros_like(theta0)
+    v = np.zeros_like(theta0)
+    theta = theta0.copy()
+    out = []
+    with np.errstate(all="ignore"):
+        for t in range(1, steps + 1):
+            g = A_COEFFS * theta
+            tt = t + 1 if variant == "off_by_one_t" else t
+            if variant == "t_from_zero":
+                tt = t - 1
+            if variant == "coupled_l2" and decay:
+                g = g + LAMBDA * theta
+            m = b1 * m + (1 - b1) * g
+            v = b2 * v + (1 - b2) * g * g
+            if variant == "no_bias_correction":
+                m_hat, v_hat = m, v
+            else:
+                m_hat = m / (1 - b1 ** tt)
+                v_hat = v / (1 - b2 ** tt)
+            u = m_hat / (np.sqrt(v_hat) + ADAMW_EPS)
+            if (variant == "correct" and decay) or variant == "decay_on_excluded":
+                u = u + LAMBDA * theta
+            theta = theta - ETA * u
+            out.append(theta.copy())
+    return out
+
+
+def _max_miss(thetas, table):
+    return max(float(np.max(np.abs(thetas[t - 1] - np.asarray(table[t])))) for t in (1, 2, 3))
+
+
+def test_reference_loop_correct_variant_matches_both_tables():
+    assert _max_miss(_ref_run("correct", THETA0, decay=True),
+                     {t: TRAJECTORY_DECAY[t]["theta"] for t in (1, 2, 3)}) < 1e-12
+    assert _max_miss(_ref_run("correct", THETA0, decay=False),
+                     TRAJECTORY_NO_DECAY_THETA) < 1e-12
+
+
+@pytest.mark.parametrize("variant", ["off_by_one_t", "no_bias_correction", "coupled_l2"])
+def test_buggy_variants_miss_decay_table(variant):
+    table = {t: TRAJECTORY_DECAY[t]["theta"] for t in (1, 2, 3)}
+    assert _max_miss(_ref_run(variant, THETA0, decay=True), table) > 1e-6
+
+
+def test_decay_on_excluded_key_misses_no_decay_table():
+    assert _max_miss(_ref_run("decay_on_excluded", THETA0, decay=False),
+                     TRAJECTORY_NO_DECAY_THETA) > 1e-6
+
+
+def test_t_from_zero_gives_non_finite_first_update():
+    first = _ref_run("t_from_zero", THETA0, steps=1, decay=True)[0]
+    assert not np.all(np.isfinite(first))
+
+
+def test_real_optimizer_matches_where_every_bug_fails():
+    opt = _make_opt(DECAY_KEY, THETA0)
+    got = {}
+    for t in (1, 2, 3):
+        opt.step({DECAY_KEY: A_COEFFS * opt.params[DECAY_KEY]})
+        got[t] = opt.params[DECAY_KEY].copy()
+    assert _max_miss([got[1], got[2], got[3]],
+                     {t: TRAJECTORY_DECAY[t]["theta"] for t in (1, 2, 3)}) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# A3: validation, non-mutation, determinism
+# ---------------------------------------------------------------------------
+def _small_opt():
+    return optim.AdamW({"h.0.mlp.fc.W": np.ones((2, 3)), "h.0.mlp.fc.b": np.zeros(3)}, lr=0.1)
+
+
+def test_step_rejects_missing_extra_wrong_shape_and_float32_grads():
+    good = {"h.0.mlp.fc.W": np.ones((2, 3)), "h.0.mlp.fc.b": np.ones(3)}
+    for bad in (
+        {"h.0.mlp.fc.W": np.ones((2, 3))},                                   # missing
+        {**good, "h.0.mlp.fc.extra": np.ones(1)},                            # extra
+        {**good, "h.0.mlp.fc.W": np.ones((3, 2))},                           # wrong shape
+        {**good, "h.0.mlp.fc.b": np.ones(3, dtype=np.float32)},              # float32
+    ):
+        opt = _small_opt()
+        before = {k: v.copy() for k, v in opt.params.items()}
+        with pytest.raises((ValueError, TypeError)):
+            opt.step(bad)
+        assert opt.t == 0
+        for k in before:
+            assert np.array_equal(opt.params[k], before[k])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"lr": 0.0}, {"lr": -1.0},
+    {"lr": 0.1, "betas": (1.0, 0.9)}, {"lr": 0.1, "betas": (0.9, 1.0)},
+    {"lr": 0.1, "betas": (-0.1, 0.9)},
+    {"lr": 0.1, "eps": 0.0}, {"lr": 0.1, "eps": -1e-8},
+    {"lr": 0.1, "weight_decay": -0.1},
+])
+def test_constructor_validation(kwargs):
+    with pytest.raises(ValueError):
+        optim.AdamW({"h.0.mlp.fc.b": np.zeros(2)}, **kwargs)
+
+
+def test_step_does_not_mutate_grads():
+    opt = _small_opt()
+    grads = {"h.0.mlp.fc.W": np.full((2, 3), 0.5), "h.0.mlp.fc.b": np.full(3, -0.25)}
+    snap = {k: v.copy() for k, v in grads.items()}
+    opt.step(grads)
+    for k in grads:
+        assert np.array_equal(grads[k], snap[k])
+
+
+def test_two_identical_runs_are_bit_identical():
+    def run():
+        model, p, grads = _tiny_model_batch()
+        opt = optim.AdamW(model.named_parameters(p), lr=_A3_LR, weight_decay=ADAMW_WEIGHT_DECAY)
+        for _ in range(3):
+            opt.step(grads)
+        return {k: v.copy() for k, v in p.items()}
+
+    a, b = run(), run()
+    assert set(a) == set(b)
+    for k in a:
+        assert np.array_equal(a[k], b[k])
