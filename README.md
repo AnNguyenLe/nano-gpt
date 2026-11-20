@@ -9,6 +9,8 @@ works: every component is checked against a closed-form value, an exact invarian
 oracle, or a central-difference gradient check (float64, relative error < 1e-6), and each check has
 a deliberately broken variant proving it can actually fail.
 
+- **New to this? Start with [`GUIDE.md`](GUIDE.md)**: a step-by-step beginner's guide (install, train,
+  chat in the browser, code tour, troubleshooting).
 - `PROGRESS.md` is the build log (what passed, deviations, what is next). Read it first if resuming.
 - `nanoGPT_build_requirements.md` and `nanoGPT_execution_plan.md` (one directory up) are the spec
   and the plan; `SPRINT_*_PLAN.md` are the per-sprint technical plans.
