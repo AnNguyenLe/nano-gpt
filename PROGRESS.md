@@ -641,3 +641,171 @@ plan:
 
 KV-cache (C8), sampling, generation and checkpointing stay out of scope until their
 phases.
+
+
+---
+
+## Phase 4 — Optimizer, FLOP Accounting & Training Loop  [DONE 2026-11-20]
+
+**Process:** same rules as Sprints 2–3 (per-role env-var identities, explicit pathspecs, no history
+rewrites, P0 per-commit isolation gate). Sprint 3 sign-off `dfbd373` is an ancestor of HEAD. See
+**Deviations** below: this sprint's orchestration died mid-Build and was finished by a single agent.
+
+**Owners / commits (each checked with `git show --name-only`; each touches only its owner's files):**
+
+| Role | Commits | Files |
+|---|---|---|
+| Engineer A | `515c709` [A1] constants + TL-24 groups; `c1352cd` [A2] AdamW + closed-form anchors; `18e8349` [A3] tied single state + test-the-tests | `nanogpt/optim.py`, `tests/test_adamw.py`; A1 also `nanogpt/config.py` (3 additive constants), `tests/test_config.py` (1 appended test) |
+| Engineer B | `bbf5863` [B1] `ops.matmul` chokepoint; `c8205d0` [B2] `FlopCounter` + exact inventory; `a4e6bf2` [B3] C9 band + discriminators | `nanogpt/flops.py`, `tests/test_flops.py`; B1 also `ops.py`, `attention.py`, `model.py` (`@` -> `ops.matmul` only) |
+| Engineer C | `e4babc8` [C1] batching; `04cec1b` [C2] loop + CLI; `0e351c9` [C3] loop invariants | `train.py`, `tests/test_train.py` |
+| Tech Lead | `7d16bb6` kickoff plan; Sprint 4 sign-off commit (this entry) | `SPRINT_4_PLAN.md`, `PROGRESS.md` |
+
+§9 order holds: `A1<A2<A3`, `A2<C2`, `C1<C2<C3`, `B1<B2<B3`. One milestone per commit.
+
+### Per-commit isolation (P0 gate; TL re-run, `git archive -o` + `tar -xf` into a fresh dir, full suite)
+
+| Commit | Result | | Commit | Result |
+|---|---|---|---|---|
+| `7d16bb6` kickoff | 363 passed | | `18e8349` [A3] | 459 passed |
+| `515c709` [A1] | 378 passed | | `c8205d0` [B2] | 478 passed |
+| `e4babc8` [C1] | 387 passed | | `a4e6bf2` [B3] | 495 passed |
+| `c1352cd` [A2] | 392 passed | | `04cec1b` [C2] | 502 passed |
+| `bbf5863` [B1] | 437 passed | | `0e351c9` [C3] | 516 passed |
+
+**Every interior commit is green.** Sprint 2's D1 was not repeated. Every Sprint 4 commit is a valid
+bisect point.
+
+### Real test status (TL run, HEAD `0e351c9`)
+
+`pytest tests/ -q -p no:cacheprovider`: **516 passed**, 25.6 s and 20.4 s on two consecutive runs
+(same count and results). The first full-suite run during development took longer (up to 44 s) while
+a 14-minute training run was competing for the CPU. That was contention, not a test regression.
+
+| File | Tests | Time |
+|---|---|---|
+| test_adamw.py (A) | 40 | ~1.5 s |
+| test_flops.py (B) | 80 | ~0.8 s |
+| test_train.py (C) | 30 | ~0.6 s |
+| slowest existing | test_mlp d=64 spot check 3.8-4.5 s; test_weight_tying ~2.5 s; test_gradients fixtures ~1.5 s each | all files < 10 s |
+
+### AdamW (TL-24/25/26)
+
+- **TL independent check** (own 60-digit `Decimal` scalar loop, not the plan's table): max
+  |impl - reference| over the 3-step quadratic trajectory is **7.8e-16** for both the decay and the
+  no-decay case.
+- **Groups (TL-24):** decay = 6L keys (`attn.{q,k,v,o}.W`, `mlp.{fc,proj}.W`) = **98,304** elements
+  at the default config; no-decay = 4 + 10L keys = **9,408**. They sum to `formula_from_config`
+  = 107,712. Allowlist is explicit, never `ndim`-based; unknown key and `lm_head.W` raise.
+- **Tied single state:** `len(opt.state) == len(param_keys()) == 36` at the default config,
+  `lm_head.W` absent, `opt.params["wte.W"] is p["wte.W"]`. After one step `m == (1-b1)*g` (one
+  accumulation, not two). Adversary with two states moves `wte.W` **~2x** as far (asserted 1.9-2.1).
+- **Test-the-tests (all confirmed by passing assertions):** off-by-one t, no bias correction,
+  coupled L2, decay on an excluded key each miss the section 3.2 table by > 1e-6; t from 0 gives a
+  non-finite first update; two-state tied adversary caught.
+- **No test asserts that a loss decreased**, and `test_train.py` enforces this with an AST guard
+  (itself test-the-tested on synthetic sources).
+
+### C9 — FLOPs per token (instrumented counter at the single `ops.matmul` chokepoint, TL-27)
+
+TL re-measured on its own seed (B=2), five configs. Counts equal the exact matmul inventory
+(24Ld^2 + 2Vd dense, 4LTd attention) **to the integer**; backward = 2x forward exactly; train/fwd
+= 3.0000.
+
+| Config (V=55) | fwd/tok | corrected 2N+4LTd | ratio | naive 2N ratio | attn share |
+|---|---|---|---|---|---|
+| tiny d=8 T=4 L=2 | 4,208 | 4,720 | 0.8915 | 0.9427 | 6.1% |
+| default d=64 T=64 L=2 | 236,416 | 248,192 | 0.9526 | 1.0974 | 13.9% |
+| long d=64 T=128 L=4 (in range) | 531,328 | 554,624 | 0.9580 | **1.2545 (fails band)** | 24.7% |
+| max d=128 T=128 L=4 | 1,849,088 | 1,895,680 | 0.9754 | 1.1320 | 14.2% |
+| discriminator d=16 T=128 L=2 (out of range) | 30,432 | 35,424 | 0.8591 | **1.5983 (fails band)** | 53.8% |
+
+(Attention share here is of the *measured* matmul total. The plan's TL-30 column used the share of
+the *corrected formula* total, which gives 13.2% / 13.8% at default / max. Both lie in the spec's
+13-20% at default and max.)
+
+The naive 2N/6N formula **passes** the band at tiny, default and max. It fails only at the two
+attention-heavy configs. So C9 is discriminating because of the integer-exact inventory plus those
+configs, not because of the band alone; the tests assert this on purpose. Test-the-tests: an
+attention-blind counter fails the exact inventory and the discriminator band; a backward pass
+outside the counter gives train/tok ~ fwd/tok (ratio ~0.32) and fails the training band.
+**One real training step under `FlopCounter`** (B=16, default config) equals the exact inventory,
+and `AdamW.step` adds **0** matmuls. The TL-27 subclass counter was not re-implemented (AST-checked).
+
+### Chokepoint refactor (B1) — regression proof
+
+12 production `@` sites became `ops.matmul(...)`. Bit-identical results: the 363 pre-existing tests
+passed unmodified at `bbf5863` (437 total with the new B1 tests). A new AST guard fails on any bare
+`@` outside `ops.matmul`, on `np.dot/matmul/einsum/tensordot/inner/vdot`, on any `.dot(`, and on
+`from nanogpt.ops import matmul`; it is itself tested on synthetic sources. `attention_reference.py`
+is excluded.
+
+### Real training run (TL, outside pytest) — C-budget check
+
+`python -u train.py` at the defaults (`ModelConfig(V=55, T=64, d=64, L=2, H=4)`, N = 107,712,
+batch 16, lr 1e-3 constant, wd 0.1, betas (0.9, 0.99), 4000 steps, seed 1337, synthetic corpus
+SHA `7afc055a`):
+
+- **841.1 s = 14.0 min, 0.210 s/step.** Budget is 30 min. Headroom ~2.1x.
+- Step-0 loss **4.0333** vs ln 55 = 4.0073 (consistency print only; C2 already proves this).
+- Loss log every 100 steps, **record only, not evidence of correctness**: 2.524 (100), 1.897 (500),
+  1.197 (1000), 1.142 (2000), 1.098 (3000), 1.138 (3999). The loss plateaus near 1.1 because the
+  synthetic corpus has irreducible entropy, not because of a defect. This is not used for anything.
+- Profile (20 steps, `--profile 20`): ~72% of time in backward, ~28% forward; `ops.matmul` itself is
+  ~4.2 of 6.9 s under cProfile; `gelu_forward` + `gelu_backward` are the next largest (~20%).
+  No trimming of batch/steps/L/d/T was needed.
+
+### Rulings (TL-24..TL-31, R22..R27) and ratification
+
+R22 no checkpointing/save hook this sprint; R23 `tests/test_adamw.py`; R24 `train.py` at repo root;
+R25 C9 configs = tiny, default, long, max + out-of-range discriminator; R26 split A=optim, B=flops,
+C=train; R27 no LR schedule / val split / README edit. TL-24 decay groups, TL-25 canonical names +
+in-place updates, TL-26 `t` starts at 1, TL-27 chokepoint, TL-28/29 FLOP counting + exact
+inventory, TL-30 C9 configs, TL-31 `train.py` contract and budget.
+
+**FOR PO RATIFICATION (unratified): TL-24 — `wpe.W` is excluded from weight decay.** The spec says
+"weight matrices". We read that as the linear maps (minGPT convention). Karpathy's nanoGPT decays
+every >= 2-D tensor including embeddings, so this is a genuine reading choice. The decision is a
+one-line change to `NO_DECAY_PATTERNS`, covered by `test_decay_groups_match_param_keys_exactly`.
+
+### Static checks (TL)
+
+`grep "TODO(SPRINT" nanogpt/` empty; conventions guard green; no torch/jax/tf/autograd; no bare
+`1e-8` in `optim.py` (it imports `ADAMW_EPS`); no `lm_head` key in `param_keys()` or `opt.state`;
+chokepoint guard green. **No Phase 5+ files exist** (`kv_cache.py`, `sampling.py`, `checkpoint.py`,
+`generate.py`, `tests/test_kv_cache.py`, `tests/test_numerical_stability.py`); `train.py` has no
+save/load, sampling or generation. Corpus SHA-256 still `7afc055a...2854`, V = 55.
+
+### Deviations from SPRINT_4_PLAN.md
+
+- **D-S4-1 (process, material).** The Workflow orchestration did not finish. Planning ran (TL plan
+  committed as `7d16bb6`); Build produced `[A1]` and `[C1]` as commits and left `[A2]` + `[B1]`
+  staged but uncommitted. `[A2]`/`[B1]` were split into their proper commits, and `[A3]`, `[B2]`,
+  `[B3]`, `[C2]`, `[C3]` were written by a single agent directly from the plan, committed under the
+  `Engineer A/B/C` identities the plan assigns to those files. Authorship on those five commits is
+  role-accurate, not agent-accurate. Each commit passed the section 8.2 pre-commit check
+  (committed tree + only that milestone's files) before landing, and the isolation table above was
+  re-run afterwards.
+- **D-S4-2 (process, material). No PO pass was run for Sprint 4**: no independent fresh-seed
+  re-verification, mutant injection or accept/reject verdict by a PO. The TL re-measurements above
+  are the only independent verification. TL-24 is therefore unratified. Both items are carried into
+  Sprint 5's acceptance phase unless the user asks for a PO pass first.
+- **D-S4-3 (minor).** `git archive HEAD | tar -x` corrupts the stream under PowerShell; the gate was
+  run via `git archive -o <file>.tar` then `tar -xf`.
+- **D-S4-4 (minor).** `python train.py` buffers stdout when piped; use `python -u` for a background run.
+- **D-S4-5 (minor).** `train.py` gained an additive `profile_steps` keyword on `train()` (section 3.5
+  lists no such argument) so that `--profile N` can cProfile the first N steps of the real loop.
+  It defaults to 0 and changes nothing otherwise.
+
+### Watch items for Sprint 5
+
+- **Phase 5 changes the forward path structurally.** The plan (`SPRINT_5_PLAN.md`, TL-32) makes the
+  cached path purely additive (`forward_step`/`prefill`) so that C5/C6/C7/C9 stay signed off by the
+  unmodified Sprint 1-4 suite. TL-9 is to be reconfirmed on HEAD at sign-off regardless.
+- Every new matmul must go through `ops.matmul` (`kind="attention"` for the per-head products) or
+  the chokepoint guard fails.
+- The conventions guard scans only `nanogpt/*.py`; root-level `train.py` and the coming `generate.py`
+  are covered by discipline and by their own AST guards, not by that scan.
+- Suite runtime: 516 tests ~20-25 s. Budget 60 s.
+
+**Next: Phase 5 — Generation (Sprint 5).** `kv_cache.py`, `sampling.py`, `checkpoint.py`,
+`generate.py`, and C8 (teacher-forced, length <= T, 1e-10 absolute).
