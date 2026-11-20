@@ -397,3 +397,65 @@ def test_main_save_writes_a_loadable_checkpoint_that_matches_the_run(tmp_path, c
     assert (cfg.L, cfg.d, cfg.T, cfg.H) == (2, 8, 4, 2) and cfg.V == 55
     assert opt_state["t"] == 2
     assert "lm_head.W" not in params and params["wte.W"].flags["C_CONTIGUOUS"]
+
+# ===========================================================================
+# PO-review additions (Sprint 4 independent review): train() must really PASS its
+# hyperparameters through, and the batch RNG stream must be pinned.
+# ===========================================================================
+def test_train_passes_lr_betas_and_weight_decay_to_adamw(real_ids, monkeypatch):
+    info, tok, ids = real_ids
+    seen = {}
+    orig_init = optim_module.AdamW.__init__
+
+    def spy(self, params, **kw):
+        seen.update(kw)
+        return orig_init(self, params, **kw)
+
+    monkeypatch.setattr(optim_module.AdamW, "__init__", spy)
+    _tiny_train(ids, tok.vocab_size, steps=1, lr=0.0123, betas=(0.7, 0.8), weight_decay=0.037)
+    assert seen["lr"] == 0.0123 and tuple(seen["betas"]) == (0.7, 0.8) and seen["weight_decay"] == 0.037
+
+
+def test_train_defaults_use_the_config_hyperparameters(real_ids, monkeypatch):
+    from nanogpt.config import ADAMW_BETAS, ADAMW_WEIGHT_DECAY
+
+    info, tok, ids = real_ids
+    seen = {}
+    orig_init = optim_module.AdamW.__init__
+
+    def spy(self, params, **kw):
+        seen.update(kw)
+        return orig_init(self, params, **kw)
+
+    monkeypatch.setattr(optim_module.AdamW, "__init__", spy)
+    train_module.train(tiny_config(tok.vocab_size), ids, steps=1, batch_size=2, lr=1e-2,
+                       log_fn=lambda *_a, **_k: None)
+    assert tuple(seen["betas"]) == tuple(ADAMW_BETAS) and seen["weight_decay"] == ADAMW_WEIGHT_DECAY
+
+
+def test_different_lr_betas_or_weight_decay_change_the_result(real_ids):
+    # Behavioural counterpart of the spy tests: each hyperparameter must matter.
+    info, tok, ids = real_ids
+    _, base = _tiny_train(ids, tok.vocab_size, steps=3, lr=1e-2)
+    for kw in ({"lr": 2e-2}, {"betas": (0.5, 0.9)}, {"weight_decay": 0.0}):
+        args = {"lr": 1e-2, **kw}
+        _, other = _tiny_train(ids, tok.vocab_size, steps=3, **args)
+        assert any(not np.array_equal(base.params[k], other.params[k]) for k in base.params), kw
+
+
+def test_batch_rng_is_seed_plus_one_and_distinct_from_the_init_rng(real_ids, monkeypatch):
+    # train() draws init weights from make_rng(seed) and batches from make_rng(seed + 1).
+    info, tok, ids = real_ids
+    cfg = tiny_config(tok.vocab_size)
+    drawn = []
+    orig = train_module.get_batch
+
+    def spy(data, batch_size, T, rng):
+        drawn.append(rng.bit_generator.state["state"]["state"])
+        return orig(data, batch_size, T, rng)
+
+    monkeypatch.setattr(train_module, "get_batch", spy)
+    train_module.train(cfg, ids, steps=1, batch_size=2, lr=1e-2, seed=555, log_fn=lambda *_a, **_k: None)
+    fresh_plus_one = make_rng(555 + 1).bit_generator.state["state"]["state"]
+    fresh_same = make_rng(555).bit_generator.state["state"]["state"]
+    assert drawn[0] == fresh_plus_one and drawn[0] != fresh_same
