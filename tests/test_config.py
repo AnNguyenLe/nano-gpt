@@ -196,3 +196,15 @@ def test_tiny_config_shape():
     assert cfg.H == 2
     assert cfg.T == 4
     assert cfg.head_dim == 4
+
+
+# ---------------------------------------------------------------------------
+# AdamW constants (Phase 4, Engineer A, milestone A1)
+# ---------------------------------------------------------------------------
+def test_adamw_constants():
+    assert config.ADAMW_BETAS == (0.9, 0.99)
+    assert config.ADAMW_EPS == 1e-8
+    assert config.ADAMW_WEIGHT_DECAY == 0.1
+    # No existing constant changed value as a side effect of this addition.
+    assert config.FLOPS_REL_BAND == 0.25
+    assert config.ROUNDOFF_ATOL == 1e-12
