@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanoGPT in NumPy</title>
+<style>
+  :root { --bg:#212121; --panel:#171717; --user:#2f2f2f; --text:#ececec; --muted:#9b9b9b; --accent:#10a37f; --warn:#d9a441; --err:#e5675d; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: flex; height: 100%; }
+  aside { width: 290px; background: var(--panel); padding: 18px; overflow-y: auto; border-right: 1px solid #2a2a2a; flex-shrink: 0; }
+  aside h1 { font-size: 16px; margin: 0 0 4px; }
+  aside .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 4px; }
+  label span { float: right; color: var(--text); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=number] { width: 100%; background: var(--user); color: var(--text); border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px 8px; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 13px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 14px; font-size: 14px; cursor: pointer; }
+  button.secondary { background: var(--user); color: var(--text); border: 1px solid #3a3a3a; }
+  button:disabled { opacity: .5; cursor: default; }
+  .box { background: var(--user); border-radius: 8px; padding: 10px 12px; font-size: 12px; color: var(--muted); margin-top: 16px; }
+  .box b { color: var(--text); }
+  .vocab { font-family: ui-monospace, Consolas, monospace; color: var(--text); word-break: break-all; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #banner { padding: 8px 18px; font-size: 13px; background: #3a2f12; color: var(--warn); display: none; }
+  #chat { flex: 1; overflow-y: auto; padding: 24px 0 8px; }
+  .row { max-width: 760px; margin: 0 auto; padding: 8px 20px; }
+  .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .msg { white-space: pre-wrap; word-wrap: break-word; }
+  .row.user .msg { background: var(--user); border-radius: 14px; padding: 10px 14px; display: inline-block; max-width: 100%; }
+  .row.bot .msg .prompt { color: var(--muted); }
+  .row.bot .msg .gen { color: var(--text); }
+  .cursor { display: inline-block; width: 7px; height: 1em; background: var(--text); vertical-align: -2px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .note { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .note.err { color: var(--err); }
+  .empty { max-width: 760px; margin: 12vh auto 0; padding: 0 20px; color: var(--muted); }
+  .empty h2 { color: var(--text); font-weight: 600; }
+  .empty code { background: var(--user); border-radius: 4px; padding: 1px 5px; color: var(--text); }
+  footer { padding: 10px 20px 18px; }
+  #form { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end;
+    background: var(--user); border-radius: 18px; padding: 8px 8px 8px 16px; }
+  textarea { flex: 1; resize: none; background: transparent; border: 0; outline: 0; color: var(--text);
+    font: inherit; max-height: 140px; padding: 6px 0; }
+  #count { text-align: center; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  @media (max-width: 760px) { aside { display: none; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <h1>nanoGPT in NumPy</h1>
+    <div class="sub">hand-written forward and backward passes, no autograd</div>
+
+    <label>Max new characters <span id="v_max">40</span></label>
+    <input id="max_new" type="range" min="1" max="63" value="40">
+
+    <label>Temperature <span id="v_temp">0.80</span></label>
+    <input id="temperature" type="range" min="0.05" max="2" step="0.05" value="0.8">
+
+    <label>Top-k <span id="v_topk">off</span></label>
+    <input id="top_k" type="range" min="0" max="55" value="0">
+
+    <div class="check"><input id="greedy" type="checkbox"><label for="greedy" style="margin:0">Greedy (always the most likely character)</label></div>
+
+    <label>Seed (blank = random)</label>
+    <input id="seed" type="number" min="0" placeholder="random">
+
+    <div class="box" id="modelbox">loading model info...</div>
+    <div class="box"><b>How this works.</b> This is a character-level language model, not an assistant. It
+      <b>continues</b> your text. Its context is only <b id="ctx">64</b> characters, so your prompt is cut to the last
+      <i>(64 - max new)</i> characters. It only knows these characters:
+      <div class="vocab" id="vocab"></div></div>
+
+    <div style="margin-top:16px; display:flex; gap:8px">
+      <button class="secondary" id="clear">Clear chat</button>
+    </div>
+  </aside>
+
+  <main>
+    <div id="banner"></div>
+    <div id="chat"></div>
+    <footer>
+      <form id="form">
+        <textarea id="input" rows="1" placeholder="Type some text for the model to continue..." autofocus></textarea>
+        <button id="send" type="submit">Continue</button>
+        <button id="stop" type="button" class="secondary" style="display:none">Stop</button>
+      </form>
+      <div id="count"></div>
+    </footer>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let info = null, controller = null, busy = false;
+
+function bind(id, out, fmt) { const el = $(id), o = $(out); const f = () => o.textContent = fmt(el.value); el.addEventListener('input', f); f(); }
+bind('max_new', 'v_max', v => v);
+bind('temperature', 'v_temp', v => (+v).toFixed(2));
+bind('top_k', 'v_topk', v => (+v === 0 ? 'off' : v));
+
+async function loadInfo() {
+  const r = await fetch('/api/info'); info = await r.json();
+  $('ctx').textContent = info.context_length;
+  $('max_new').max = info.context_length - 1;
+  $('max_new').value = info.default_max_new; $('max_new').dispatchEvent(new Event('input'));
+  $('top_k').max = info.vocab_size;
+  $('vocab').textContent = JSON.stringify(info.vocab).slice(1, -1);
+  const c = info.config;
+  $('modelbox').innerHTML = '<b>Model:</b> ' + (info.trained ? 'trained' : '<span style="color:var(--warn)">UNTRAINED</span>') +
+    '<br>' + esc(info.source) + '<br>L=' + c.L + ' d=' + c.d + ' H=' + c.H + ' T=' + c.T + ' V=' + c.V;
+  if (!info.trained) {
+    const b = $('banner'); b.style.display = 'block';
+    b.textContent = 'No trained checkpoint found: these are random weights, so the output is noise. Run: python -u train.py --save model.ckpt, then restart serve.py.';
+  }
+  showEmpty();
+}
+
+function esc(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function showEmpty() {
+  if ($('chat').children.length) return;
+  $('chat').innerHTML = '<div class="empty"><h2>Give it the start of a sentence</h2>' +
+    '<p>It was trained on a synthetic corpus of short, simple English-like sentences, so try something like ' +
+    '<code>The rain </code>, <code>Remember </code> or <code>Good, from </code> and see how it continues.</p>' +
+    '<p>It will not answer questions or follow instructions: it only predicts the next character.</p></div>';
+}
+function addRow(kind, html) {
+  if ($('chat').querySelector('.empty')) $('chat').innerHTML = '';
+  const d = document.createElement('div'); d.className = 'row ' + kind;
+  d.innerHTML = '<div class="who">' + (kind === 'user' ? 'You' : 'Model') + '</div><div class="msg">' + html + '</div>';
+  $('chat').appendChild(d); $('chat').scrollTop = $('chat').scrollHeight; return d;
+}
+function addNote(row, text, err) {
+  const n = document.createElement('div'); n.className = 'note' + (err ? ' err' : ''); n.textContent = text; row.appendChild(n);
+}
+
+function setBusy(b) { busy = b; $('send').disabled = b; $('stop').style.display = b ? '' : 'none'; $('send').style.display = b ? 'none' : ''; }
+
+async function send(text) {
+  const params = {
+    prompt: text,
+    max_new: +$('max_new').value,
+    temperature: +$('temperature').value,
+    top_k: +$('top_k').value === 0 ? null : +$('top_k').value,
+    greedy: $('greedy').checked,
+    seed: $('seed').value === '' ? null : +$('seed').value,
+  };
+  addRow('user', esc(text));
+  const row = addRow('bot', '<span class="prompt"></span><span class="gen"></span><span class="cursor"></span>');
+  const promptEl = row.querySelector('.prompt'), genEl = row.querySelector('.gen');
+  setBusy(true); controller = new AbortController();
+  try {
+    const r = await fetch('/api/generate', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                                             body: JSON.stringify(params), signal: controller.signal });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.error || ('HTTP ' + r.status)); }
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i; while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line) continue;
+        const m = JSON.parse(line);
+        if (m.token !== undefined) { genEl.textContent += m.token; $('chat').scrollTop = $('chat').scrollHeight; }
+        else if (m.error) { throw new Error(m.error); }
+        else if (m.done) {
+          promptEl.textContent = m.used_prompt;
+          const bits = [m.tokens + ' characters', 'seed ' + m.seed];
+          if (m.truncated) bits.push('your prompt was cut by ' + m.truncated + ' leading character(s) to fit the ' + info.context_length + '-character context');
+          if (m.dropped.length) bits.push('ignored unknown characters: ' + JSON.stringify(m.dropped.join('')));
+          addNote(row, bits.join(' | '));
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') addNote(row, 'stopped');
+    else addNote(row, e.message, true);
+  } finally {
+    const c = row.querySelector('.cursor'); if (c) c.remove();
+    setBusy(false); controller = null; $('input').focus();
+  }
+}
+
+$('form').addEventListener('submit', (ev) => {
+  ev.preventDefault(); if (busy) return;
+  const t = $('input').value; if (!t.trim()) return;
+  $('input').value = ''; autosize(); send(t);
+});
+$('input').addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); $('form').requestSubmit(); } });
+$('input').addEventListener('input', () => { autosize(); counter(); });
+$('stop').addEventListener('click', () => controller && controller.abort());
+$('clear').addEventListener('click', () => { if (busy) return; $('chat').innerHTML = ''; showEmpty(); });
+function autosize() { const t = $('input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 140) + 'px'; }
+function counter() {
+  if (!info) return; const t = $('input').value; const unk = [...new Set([...t].filter(c => !info.vocab.includes(c)))];
+  $('count').textContent = unk.length ? 'unknown to the model (will be ignored): ' + JSON.stringify(unk.join('')) : '';
+}
+loadInfo().catch(e => { $('banner').style.display = 'block'; $('banner').textContent = 'Could not reach the server: ' + e.message; });
+</script>
+</body>
+</html>
