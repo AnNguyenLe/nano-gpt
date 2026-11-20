@@ -212,3 +212,167 @@ def test_train_profile_steps_logs_a_profile(real_ids):
     train_module.train(tiny_config(tok.vocab_size), ids, steps=2, batch_size=2, lr=1e-2,
                        log_fn=lines.append, profile_steps=2)
     assert any("cProfile" in s for s in lines)
+
+
+# ===========================================================================
+# [C3] Loop invariants
+# ===========================================================================
+import ast  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import nanogpt.model as model_module  # noqa: E402
+import nanogpt.optim as optim_module  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_two_runs_with_same_seed_are_bit_identical(real_ids):
+    info, tok, ids = real_ids
+    _, a = _tiny_train(ids, tok.vocab_size, steps=4)
+    _, b = _tiny_train(ids, tok.vocab_size, steps=4)
+    assert a.losses == b.losses
+    assert set(a.params) == set(b.params)
+    for k in a.params:
+        assert np.array_equal(a.params[k], b.params[k]), k
+
+
+def test_different_seed_gives_different_run(real_ids):
+    info, tok, ids = real_ids
+    _, a = _tiny_train(ids, tok.vocab_size, steps=2, seed=DEFAULT_SEED)
+    _, b = _tiny_train(ids, tok.vocab_size, steps=2, seed=DEFAULT_SEED + 1)
+    assert a.losses != b.losses
+
+
+def test_tie_preserved_through_training(real_ids):
+    info, tok, ids = real_ids
+    cfg = tiny_config(tok.vocab_size)
+    seen = {}
+    orig_init = model_module.GPT.init_params
+
+    def spy(self, rng):
+        p = orig_init(self, rng)
+        seen["wte"] = p["wte.W"]
+        return p
+
+    model_module.GPT.init_params = spy
+    try:
+        _, res = _tiny_train(ids, tok.vocab_size, steps=3)
+    finally:
+        model_module.GPT.init_params = orig_init
+
+    assert res.params["wte.W"] is seen["wte"]  # same object as at init
+    assert res.params["wte.W"].flags["C_CONTIGUOUS"]
+    named = res.model.named_parameters(res.params)
+    assert named["lm_head.W"] is res.params["wte.W"]
+    assert cfg.V == res.params["wte.W"].shape[0]
+
+
+def test_single_optimizer_state_and_step_count(real_ids):
+    info, tok, ids = real_ids
+    _, res = _tiny_train(ids, tok.vocab_size, steps=4)
+    opt = res.optimizer
+    assert len(opt.state) == len(res.model.param_keys())
+    assert "lm_head.W" not in opt.state
+    assert opt.t == 4
+
+
+def test_adamw_step_is_really_used_exactly_steps_times(real_ids, monkeypatch):
+    info, tok, ids = real_ids
+    calls = {"n": 0}
+    orig = optim_module.AdamW.step
+
+    def counting(self, grads):
+        calls["n"] += 1
+        return orig(self, grads)
+
+    monkeypatch.setattr(optim_module.AdamW, "step", counting)
+    _tiny_train(ids, tok.vocab_size, steps=6)
+    assert calls["n"] == 6
+
+
+def test_non_finite_loss_raises_floating_point_error(real_ids, monkeypatch):
+    info, tok, ids = real_ids
+    orig = model_module.GPT.forward_loss
+
+    def nan_loss(self, idx, targets, params):
+        _, cache = orig(self, idx, targets, params)
+        return float("nan"), cache
+
+    monkeypatch.setattr(model_module.GPT, "forward_loss", nan_loss)
+    with pytest.raises(FloatingPointError):
+        _tiny_train(ids, tok.vocab_size, steps=2)
+
+
+def _imported_roots(tree):
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(node.module or "")
+            names.update(a.name for a in node.names)
+    return names
+
+
+_PHASE5_WORDS = ("checkpoint", "kv_cache", "sampling", "generate")
+
+
+def _scope_violations(source: str):
+    """R22: train.py must contain no checkpoint/kv-cache/sampling/generate
+    import and no np.save / pickle use."""
+    tree = ast.parse(source)
+    bad = [n for n in _imported_roots(tree) if any(w in n for w in _PHASE5_WORDS) or "pickle" in n]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ("save", "savez", "savez_compressed") \
+                and isinstance(node.value, ast.Name) and node.value.id == "np":
+            bad.append(f"np.{node.attr}")
+        if isinstance(node, ast.Name) and node.id == "pickle":
+            bad.append("pickle")
+    return bad
+
+
+def test_train_py_has_no_phase5_scope_creep():
+    src = (_REPO_ROOT / "train.py").read_text(encoding="utf-8")
+    assert _scope_violations(src) == []
+
+
+@pytest.mark.parametrize("snippet", [
+    "from nanogpt.checkpoint import save",
+    "import nanogpt.kv_cache",
+    "from nanogpt import sampling",
+    "import pickle",
+    "import numpy as np\nnp.save('x.npy', 1)",
+])
+def test_scope_guard_catches_synthetic_violations(snippet):
+    assert _scope_violations(snippet) != []
+
+
+def _loss_decrease_comparisons(source: str):
+    """Compare nodes of the form losses[...] < losses[...] (any ordering op)."""
+    def is_losses_subscript(n):
+        if not isinstance(n, ast.Subscript):
+            return False
+        v = n.value
+        return (isinstance(v, ast.Name) and v.id.endswith("losses")) or \
+               (isinstance(v, ast.Attribute) and v.attr.endswith("losses"))
+
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Compare) and any(
+                isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for op in node.ops):
+            operands = [node.left] + list(node.comparators)
+            if sum(is_losses_subscript(o) for o in operands) >= 2:
+                hits.append(node.lineno)
+    return hits
+
+
+def test_no_loss_decrease_assertion_in_this_file():
+    # Non-functional rule: a decreasing loss is never evidence of correctness.
+    src = Path(__file__).read_text(encoding="utf-8")
+    assert _loss_decrease_comparisons(src) == []
+
+
+def test_loss_decrease_guard_catches_the_forbidden_pattern():
+    assert _loss_decrease_comparisons("assert res.losses[-1] < res.losses[0]") != []
+    assert _loss_decrease_comparisons("assert losses[0] >= losses[-1]") != []
+    assert _loss_decrease_comparisons("assert losses[0] == losses[1]") == []
