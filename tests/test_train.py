@@ -314,7 +314,8 @@ def _imported_roots(tree):
     return names
 
 
-_PHASE5_WORDS = ("checkpoint", "kv_cache", "sampling", "generate")
+# TL-40 (Sprint 5): "checkpoint" is now permitted (train.py --save); the rest of R22 stands.
+_PHASE5_WORDS = ("kv_cache", "sampling", "generate")
 
 
 def _scope_violations(source: str):
@@ -337,7 +338,6 @@ def test_train_py_has_no_phase5_scope_creep():
 
 
 @pytest.mark.parametrize("snippet", [
-    "from nanogpt.checkpoint import save",
     "import nanogpt.kv_cache",
     "from nanogpt import sampling",
     "import pickle",
@@ -376,3 +376,24 @@ def test_loss_decrease_guard_catches_the_forbidden_pattern():
     assert _loss_decrease_comparisons("assert res.losses[-1] < res.losses[0]") != []
     assert _loss_decrease_comparisons("assert losses[0] >= losses[-1]") != []
     assert _loss_decrease_comparisons("assert losses[0] == losses[1]") == []
+
+def test_train_py_may_import_checkpoint_but_nothing_else_from_phase5():
+    # TL-40: --save needs checkpoint; the remaining R22 scope limits are unchanged.
+    assert _scope_violations("from nanogpt import checkpoint") == []
+    assert _scope_violations("from nanogpt import kv_cache") != []
+    assert _scope_violations("import generate") != []
+
+
+def test_main_save_writes_a_loadable_checkpoint_that_matches_the_run(tmp_path, capsys):
+    from nanogpt import checkpoint as ckpt
+
+    path = tmp_path / "t.ckpt"
+    rc = train_module.main([
+        "--L", "2", "--d", "8", "--T", "4", "--H", "2", "--allow-out-of-range",
+        "--steps", "2", "--batch-size", "2", "--lr", "0.01", "--log-every", "1", "--save", str(path),
+    ])
+    assert rc == 0 and "saved checkpoint" in capsys.readouterr().out
+    cfg, params, opt_state = ckpt.load(path)
+    assert (cfg.L, cfg.d, cfg.T, cfg.H) == (2, 8, 4, 2) and cfg.V == 55
+    assert opt_state["t"] == 2
+    assert "lm_head.W" not in params and params["wte.W"].flags["C_CONTIGUOUS"]

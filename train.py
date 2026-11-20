@@ -12,8 +12,9 @@ only walks `nanogpt/*.py`), but it still imports every numeric constant it
 needs from `nanogpt.config` rather than re-deriving them, as a matter of
 style, not because a guard enforces it here.
 
-R22 (ruling, out of scope this sprint): no checkpointing, no save/load, no
-sampling, no generation, and no KV-cache. Loss is logged for visibility but
+R22 (ruling; amended by TL-40 in Sprint 5): no sampling, no generation and no
+KV-cache here. The only checkpoint hook is the optional `--save PATH` flag, which
+calls `nanogpt.checkpoint.save` after training (so train.py -> generate.py works). Loss is logged for visibility but
 training loss going down is NEVER asserted anywhere (constant LR only; no
 schedule).
 
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from nanogpt import checkpoint
 from nanogpt.config import (
     ADAMW_BETAS,
     ADAMW_WEIGHT_DECAY,
@@ -205,6 +207,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--H", type=int, default=4)
     ap.add_argument("--allow-out-of-range", action="store_true",
                     help="permit L/d/T outside the spec ranges (L 2-4, d 64-128, T 64-128)")
+    ap.add_argument("--save", metavar="PATH", default=None,
+                    help="after training, write a checkpoint (params + AdamW state) to PATH")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
                     help="cProfile the first N steps and print the top 20 by cumtime")
     return ap
@@ -240,6 +244,9 @@ def main(argv=None) -> int:
         weight_decay=args.weight_decay, seed=args.seed, log_every=args.log_every,
         profile_steps=args.profile,
     )
+    if args.save:
+        checkpoint.save(args.save, res.model, res.params, res.optimizer)
+        print(f"saved checkpoint to {args.save}")
     n = len(res.step_times)
     print(f"step-0 loss {res.init_loss:.4f} vs ln V {math.log(V):.4f} (consistency print only)")
     print(f"done: {n} steps in {res.wall_time_s:.1f}s "
