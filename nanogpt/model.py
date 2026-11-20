@@ -260,3 +260,45 @@ class GPT:
         d_logits, _ = loss_mod.cross_entropy_backward(d_loss, cache["c_loss"])
         _, grads = self.backward(d_logits, cache["c_fwd"])
         return None, grads
+
+    # -- Sprint 5 [A2] (TL-32/36): inference-only cached decoding -------------
+    # ADDITIVE: nothing above changed. No backward, never gradchecked.
+    def forward_step(self, idx_step, params: dict, kv):
+        """Decode one position. idx_step: (B,1) ids; returns logits (B,1,V).
+
+        The new token is embedded at absolute position ``pos = kv.length``,
+        read BEFORE the layers append (TL-36); each block appends its K/V at
+        that same index; ``kv.advance()`` runs once after the last block.
+        """
+        idx_step = np.asarray(idx_step)
+        if idx_step.ndim != 2 or idx_step.shape[1] != 1:
+            raise ValueError(f"GPT.forward_step: idx_step must be (B, 1), got {idx_step.shape}")
+        if not np.issubdtype(idx_step.dtype, np.integer):
+            raise TypeError(f"GPT.forward_step: idx_step must be integer, got {idx_step.dtype!r}")
+        pos = kv.length
+        if pos >= self.cfg.T:
+            raise ValueError(
+                f"GPT.forward_step: position {pos} >= context length T={self.cfg.T} "
+                "(no sliding window)"
+            )
+
+        tok_emb, _ = self.wte.forward(idx_step, params)  # (B,1,d)
+        pos_emb, _ = self.wpe.forward(np.array([pos], dtype=INT_DTYPE), params)  # (1,d)
+        h = tok_emb + pos_emb
+        for l, b in enumerate(self.blocks):
+            h = b.forward_step(h, params, kv, l)
+        kv.advance()
+
+        y, _ = self.ln_f.forward(h, params)
+        wte_W = params[f"{self.wte.prefix}.W"]
+        return ops.matmul(y, wte_W.T)
+
+    def prefill(self, idx, params: dict, kv):
+        """Run positions 0..T0-1 through ``forward_step`` one at a time and
+        return the stacked logits (B, T0, V). One code path on purpose (TL-36);
+        a batched prefill is a performance optimisation and out of scope."""
+        idx = np.asarray(idx)
+        if idx.ndim != 2:
+            raise ValueError(f"GPT.prefill: idx must be 2-D (B, T0), got ndim={idx.ndim}")
+        outs = [self.forward_step(idx[:, t : t + 1], params, kv) for t in range(idx.shape[1])]
+        return np.concatenate(outs, axis=1)

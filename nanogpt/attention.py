@@ -186,3 +186,52 @@ class CausalSelfAttention:
         d_x = dx_q + dx_k + dx_v
         d_params = {**g_q, **g_k, **g_v, **g_o}
         return d_x, d_params
+
+    # ------------------------------------------------------------------
+    # Sprint 5 [A2] (TL-32/33/36): inference-only cached forward. ADDITIVE:
+    # forward/backward above are untouched, so C5/C6/C7/C9 stay signed off by
+    # the unmodified Sprint 1-4 suite. This method has no backward and is never
+    # gradchecked; if it is wrong, C8 (tests/test_kv_cache.py) catches it.
+    # ------------------------------------------------------------------
+    def forward_step(self, x_step: np.ndarray, params: dict, kv=None, layer: int = 0):
+        """One-token cached attention. x_step: (B,1,d). Returns out_step (B,1,d).
+
+        With ``kv`` a KVCache, this step's K/V are appended for ``layer`` and
+        attention runs over every cached position plus this one. With
+        ``kv=None`` there is no history (the position-0 case).
+
+        TL-33: the allowed keys are the LAST ROW of ``mask_fn(pos + 1)``, where
+        ``pos`` is the absolute position of this token. It is applied exactly as
+        in ``forward`` (``np.where(allowed, S, -inf)`` then softmax); it is
+        never short-cut to "attend to everything cached".
+        """
+        x_step = np.asarray(x_step)
+        check_float64(x_step, names=["x_step"])
+        if x_step.ndim != 3 or x_step.shape[1] != 1 or x_step.shape[-1] != self.d:
+            raise ValueError(
+                f"CausalSelfAttention.forward_step: x_step must be (B, 1, {self.d}), "
+                f"got {x_step.shape}"
+            )
+
+        q, _ = self.q.forward(x_step, params)
+        k, _ = self.k.forward(x_step, params)
+        v, _ = self.v.forward(x_step, params)
+        qh = _split_heads(q, self.H)  # (B,H,1,hd)
+        kh = _split_heads(k, self.H)
+        vh = _split_heads(v, self.H)
+
+        if kv is None:
+            pos = 0
+            kh_all, vh_all = kh, vh
+        else:
+            pos = kv.length
+            kh_all, vh_all = kv.append(layer, kh, vh)  # (B,H,pos+1,hd)
+
+        S = ops.matmul(qh, kh_all.swapaxes(-1, -2), kind="attention") * self.scale  # (B,H,1,pos+1)
+        allowed_row = self.mask_fn(pos + 1)[pos]  # (pos+1,) bool
+        Z = np.where(allowed_row, S, -np.inf)
+        P, _ = ops.softmax_forward(Z)
+
+        Y = _merge_heads(ops.matmul(P, vh_all, kind="attention"))  # (B,1,d)
+        out, _ = self.o.forward(Y, params)
+        return out

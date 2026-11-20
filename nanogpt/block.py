@@ -116,3 +116,13 @@ class Block:
         ops.accumulate_grads(d_params, g_ln2)
         ops.accumulate_grads(d_params, g_mlp)
         return dx, d_params
+
+    def forward_step(self, x_step, params, kv=None, layer: int = 0):
+        """Sprint 5 [A2] (TL-32): inference-only one-token cached forward.
+        Same pre-LN residual structure as ``forward``; no cache dict, no backward."""
+        u1, _ = self.ln1.forward(x_step, params)
+        a = self.attn.forward_step(u1, params, kv, layer)
+        x1 = x_step + a
+        u2, _ = self.ln2.forward(x1, params)
+        m, _ = self.mlp.forward(u2, params)
+        return x1 + m

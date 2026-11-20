@@ -191,3 +191,118 @@ def test_default_config_cache_dimensions():
     cfg = ModelConfig(V=55)
     c = KVCache(cfg, B=1)
     assert c.K.shape == (2, 1, 4, 64, 16)
+
+
+# ===========================================================================
+# [A2] Cached forward (TL-32/33/36): single-step equivalence + validation
+# ===========================================================================
+from nanogpt.attention import CausalSelfAttention  # noqa: E402
+from nanogpt.block import Block  # noqa: E402
+from nanogpt.config import ROUNDOFF_ATOL  # noqa: E402
+from nanogpt.model import GPT  # noqa: E402
+
+
+def _model(cfg, seed_off=0):
+    m = GPT(cfg)
+    # Non-trivial params: default init has std 0.02 which makes logits tiny, so
+    # scale up to make attention/MLP contribute visibly to the comparison.
+    p = m.init_params(make_rng(_SEED + 100 + seed_off))
+    rng = make_rng(_SEED + 200 + seed_off)
+    for k in m.param_keys():
+        if not (k.endswith(".gamma") or k.endswith(".beta")):
+            p[k] += 0.3 * rng.standard_normal(p[k].shape) if k != "wte.W" else 0.0
+    p["wte.W"] += 0.3 * rng.standard_normal(p["wte.W"].shape)
+    return m, p
+
+
+def test_attention_forward_step_without_history_equals_forward_on_one_token():
+    cfg = tiny_config(V=11)
+    attn = CausalSelfAttention("attn", cfg.d, cfg.H)
+    p = attn.init_params(make_rng(_SEED + 11))
+    x = make_rng(_SEED + 12).standard_normal((2, 1, cfg.d))
+    full, _ = attn.forward(x, p)
+    step = attn.forward_step(x, p, kv=None)
+    assert np.max(np.abs(full - step)) <= ROUNDOFF_ATOL
+
+
+def test_block_forward_step_without_history_equals_forward_on_one_token():
+    cfg = tiny_config(V=11)
+    blk = Block("h.0", cfg.d, cfg.H)
+    p = blk.init_params(make_rng(_SEED + 13))
+    x = make_rng(_SEED + 14).standard_normal((2, 1, cfg.d))
+    full, _ = blk.forward(x, p)
+    step = blk.forward_step(x, p, kv=None)
+    assert np.max(np.abs(full - step)) <= ROUNDOFF_ATOL
+
+
+@pytest.mark.parametrize("B", [1, 3])
+def test_model_forward_step_first_token_equals_forward_on_one_token(B):
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    idx = make_rng(_SEED + 15).integers(0, cfg.V, size=(B, 1))
+    full, _ = m.forward(idx, p)
+    kv = KVCache(cfg, B)
+    step = m.forward_step(idx, p, kv)
+    assert step.shape == (B, 1, cfg.V)
+    assert np.max(np.abs(full - step)) <= ROUNDOFF_ATOL
+    assert kv.length == 1  # advanced exactly once per token, not once per layer
+
+
+def test_forward_step_advances_length_once_per_token():
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    kv = KVCache(cfg, 1)
+    idx = make_rng(_SEED + 16).integers(0, cfg.V, size=(1, 3))
+    for t in range(3):
+        m.forward_step(idx[:, t : t + 1], p, kv)
+        assert kv.length == t + 1
+
+
+def test_prefill_stacks_logits_and_matches_stepwise():
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    idx = make_rng(_SEED + 17).integers(0, cfg.V, size=(2, 3))
+    kv_a = KVCache(cfg, 2)
+    out = m.prefill(idx, p, kv_a)
+    assert out.shape == (2, 3, cfg.V) and kv_a.length == 3
+    kv_b = KVCache(cfg, 2)
+    for t in range(3):
+        step = m.forward_step(idx[:, t : t + 1], p, kv_b)
+        assert np.array_equal(out[:, t : t + 1], step)
+
+
+def test_forward_step_validation():
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    kv = KVCache(cfg, 1)
+    with pytest.raises(ValueError):
+        m.forward_step(np.zeros((1, 2), dtype=np.int64), p, kv)  # two tokens
+    with pytest.raises(TypeError):
+        m.forward_step(np.zeros((1, 1)), p, kv)  # float ids
+    attn = CausalSelfAttention("attn", cfg.d, cfg.H)
+    ap = attn.init_params(make_rng(_SEED + 18))
+    with pytest.raises(ValueError):
+        attn.forward_step(np.zeros((1, 2, cfg.d)), ap)  # not a single step
+    with pytest.raises(ValueError):
+        attn.forward_step(np.zeros((1, 1, cfg.d + 1)), ap)
+
+
+def test_forward_step_beyond_context_length_raises():
+    cfg = tiny_config(V=11)  # T = 4
+    m, p = _model(cfg)
+    kv = KVCache(cfg, 1)
+    idx = make_rng(_SEED + 19).integers(0, cfg.V, size=(1, cfg.T))
+    m.prefill(idx, p, kv)
+    assert kv.length == cfg.T
+    with pytest.raises(ValueError):
+        m.forward_step(idx[:, :1], p, kv)
+
+
+def test_forward_step_does_not_mutate_params():
+    cfg = tiny_config(V=11)
+    m, p = _model(cfg)
+    before = {k: v.copy() for k, v in p.items()}
+    kv = KVCache(cfg, 1)
+    m.prefill(make_rng(_SEED + 20).integers(0, cfg.V, size=(1, 3)), p, kv)
+    for k in before:
+        assert np.array_equal(before[k], p[k]), k
