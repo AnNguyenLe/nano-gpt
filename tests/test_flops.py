@@ -330,3 +330,190 @@ def test_matmul_bit_identical_to_at_operator(a_shape, b_shape):
     b = rng.standard_normal(b_shape)
     assert np.array_equal(ops.matmul(a, b), a @ b)
     assert np.array_equal(ops.matmul(a, b, kind="attention"), a @ b)
+
+
+# ===========================================================================
+# [B2] FlopCounter + exact matmul inventory (TL-28 / TL-29)
+# ===========================================================================
+import functools  # noqa: E402
+
+from nanogpt import flops  # noqa: E402
+from nanogpt.config import DEFAULT_SEED, ModelConfig, make_rng, tiny_config  # noqa: E402
+from nanogpt.model import GPT  # noqa: E402
+
+_B_SEED = DEFAULT_SEED + 502  # per-file fixture offset (never DEFAULT_SEED itself)
+_V = 55
+
+# TL-30 config table. "in_range" marks the spec ranges (L 2-4, d 64-128, T 64-128).
+C9_CONFIGS = {
+    "tiny": ModelConfig(V=_V, T=4, d=8, L=2, H=2),
+    "default": ModelConfig(V=_V, T=64, d=64, L=2, H=4),
+    "long": ModelConfig(V=_V, T=128, d=64, L=4, H=4),
+    "max": ModelConfig(V=_V, T=128, d=128, L=4, H=4),
+    "discriminator": ModelConfig(V=_V, T=128, d=16, L=2, H=2),
+}
+IN_RANGE_C9 = ("default", "long", "max")
+
+
+@functools.lru_cache(maxsize=None)
+def _measure(name):
+    cfg = C9_CONFIGS[name]
+    model = GPT(cfg)
+    params = model.init_params(make_rng(_B_SEED))
+    rng = make_rng(_B_SEED + 1)
+    idx = rng.integers(0, cfg.V, size=(1, cfg.T))
+    tgt = rng.integers(0, cfg.V, size=(1, cfg.T))
+    return cfg, flops.measure_train_flops(model, params, idx, tgt)
+
+
+def test_matmul_flops_unit_cases():
+    assert flops.matmul_flops((3, 4), (4, 5)) == 120
+    assert flops.matmul_flops((2, 3, 4), (4, 5)) == 240
+    assert flops.matmul_flops((2, 1, 3, 4), (1, 6, 4, 5)) == 2 * 12 * 3 * 4 * 5
+    assert flops.matmul_flops((4,), (4, 5)) == 2 * 1 * 4 * 5   # 1-D a: m = 1
+    assert flops.matmul_flops((3, 4), (4,)) == 2 * 3 * 4 * 1   # 1-D b: n = 1
+    assert flops.matmul_flops((4,), (4,)) == 2 * 4
+
+
+def test_matmul_flops_mismatched_k_raises():
+    with pytest.raises(ValueError):
+        flops.matmul_flops((3, 4), (5, 6))
+
+
+def test_matmul_flops_unbroadcastable_batch_raises():
+    with pytest.raises(ValueError):
+        flops.matmul_flops((2, 3, 4), (5, 4, 6))
+
+
+def test_counter_restores_original_matmul_on_exit_and_on_error():
+    orig = ops.matmul
+    with flops.FlopCounter():
+        assert ops.matmul is not orig
+    assert ops.matmul is orig
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with flops.FlopCounter():
+            raise RuntimeError("boom")
+    assert ops.matmul is orig
+    # and a fresh counter can start again (the active slot was released)
+    with flops.FlopCounter():
+        pass
+    assert ops.matmul is orig
+
+
+def test_calls_outside_a_counter_are_not_counted():
+    a = np.ones((2, 3))
+    b = np.ones((3, 4))
+    ops.matmul(a, b)  # before
+    with flops.FlopCounter() as fc:
+        ops.matmul(a, b)
+    ops.matmul(a, b)  # after
+    assert len(fc.calls) == 1
+    assert fc.total() == 2 * 2 * 3 * 4
+
+
+def test_nested_counter_raises_runtime_error_and_outer_survives():
+    orig = ops.matmul
+    with flops.FlopCounter() as outer:
+        with pytest.raises(RuntimeError):
+            with flops.FlopCounter():
+                pass
+        ops.matmul(np.ones((2, 2)), np.ones((2, 2)))
+        assert outer.total() == 2 * 2 * 2 * 2
+    assert ops.matmul is orig
+
+
+def test_phase_attribution_and_unphased_default():
+    a = np.ones((2, 3))
+    b = np.ones((3, 4))
+    with flops.FlopCounter() as fc:
+        ops.matmul(a, b)
+        with fc.phase("forward"):
+            ops.matmul(a, b)
+        with fc.phase("backward"):
+            ops.matmul(a, b, kind="attention")
+    assert fc.counts[("unphased", "dense")] == 48
+    assert fc.counts[("forward", "dense")] == 48
+    assert fc.counts[("backward", "attention")] == 48
+    assert fc.total("forward") == 48
+    assert fc.total(kind="dense") == 96
+    assert fc.total() == 144
+    with pytest.raises(ValueError):
+        with flops.FlopCounter() as fc2:
+            with fc2.phase("sideways"):
+                pass
+
+
+def test_counter_returns_result_unchanged_and_validates_kind():
+    a = np.arange(6.0).reshape(2, 3)
+    b = np.arange(12.0).reshape(3, 4)
+    with flops.FlopCounter() as fc:
+        out = ops.matmul(a, b)
+        with pytest.raises(ValueError):
+            ops.matmul(a, b, kind="bogus")
+    assert np.array_equal(out, a @ b)
+    assert len(fc.calls) == 1  # the rejected call is not counted
+
+
+@pytest.mark.parametrize("cfg_name", ["tiny", "default"])
+def test_counter_does_not_change_loss_or_gradients(cfg_name):
+    cfg = C9_CONFIGS[cfg_name]
+    model = GPT(cfg)
+    params = model.init_params(make_rng(_B_SEED))
+    rng = make_rng(_B_SEED + 2)
+    idx = rng.integers(0, cfg.V, size=(2, cfg.T))
+    tgt = rng.integers(0, cfg.V, size=(2, cfg.T))
+
+    loss0, c0 = model.forward_loss(idx, tgt, params)
+    _, g0 = model.backward_loss(1.0, c0)
+    with flops.FlopCounter():
+        loss1, c1 = model.forward_loss(idx, tgt, params)
+        _, g1 = model.backward_loss(1.0, c1)
+    assert loss0 == loss1
+    assert set(g0) == set(g1)
+    for k in g0:
+        assert np.array_equal(g0[k], g1[k]), k
+
+
+def test_kind_tags_agree_with_operand_shapes():
+    # "attention" calls are the 4-D (B, H, T, .) products; "dense" never are.
+    cfg = C9_CONFIGS["tiny"]
+    model = GPT(cfg)
+    params = model.init_params(make_rng(_B_SEED))
+    rng = make_rng(_B_SEED + 3)
+    idx = rng.integers(0, cfg.V, size=(2, cfg.T))
+    tgt = rng.integers(0, cfg.V, size=(2, cfg.T))
+    with flops.FlopCounter() as fc:
+        with fc.phase("forward"):
+            _, cache = model.forward_loss(idx, tgt, params)
+        with fc.phase("backward"):
+            model.backward_loss(1.0, cache)
+    kinds = {k for _, k, _, _ in fc.calls}
+    assert kinds == {"dense", "attention"}
+    for _, kind, a_shape, b_shape in fc.calls:
+        if kind == "attention":
+            assert len(a_shape) >= 4 and len(b_shape) >= 4, (a_shape, b_shape)
+        else:
+            assert not (len(a_shape) >= 4 and len(b_shape) >= 4), (a_shape, b_shape)
+
+
+@pytest.mark.parametrize("name", list(C9_CONFIGS))
+def test_exact_inventory_matches_counter_to_the_integer(name):
+    cfg, rep = _measure(name)
+    inv = flops.exact_forward_matmul_per_token(cfg)
+    assert rep.tokens == cfg.T  # B = 1, sequence length = cfg.T
+    assert rep.fwd_dense == inv["dense"] * rep.tokens
+    assert rep.fwd_attn == inv["attention"] * rep.tokens
+    # backward does exactly 2x the matmul work of forward, per kind
+    assert rep.bwd_dense == 2 * rep.fwd_dense
+    assert rep.bwd_attn == 2 * rep.fwd_attn
+
+
+def test_exact_inventory_closed_forms_at_known_configs():
+    # Hand-derived literals (TL-30 table): fwd/token = dense + attention.
+    expected = {"tiny": 4208, "default": 236416, "long": 531328,
+                "max": 1849088, "discriminator": 30432}
+    for name, want in expected.items():
+        cfg, rep = _measure(name)
+        assert rep.fwd_per_token == want, (name, rep.fwd_per_token)
+        assert rep.train_per_token == 3 * want
