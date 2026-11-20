@@ -1033,3 +1033,102 @@ the optional bonus path" holds trivially.
 
 **Project status: all correctness requirements C1-C9 pass as automated tests; Phase 7 deliberately
 skipped; independent PO acceptance of Sprints 4-6 outstanding.**
+
+---
+
+## Independent acceptance review (Sprints 4, 5, 6 + chat UI)  [DONE 2026-11-20]
+
+The open item from the Phase 8 sign-off. Two reviewers with **fresh context** (separate subagent
+sessions that did not write the code, told not to trust PROGRESS.md or commit messages, and to
+write their own references and fresh seeds) each worked in a scratch `git archive` copy, never in
+the repo. **Caveat that matters:** these are independent AI reviewers, not a human product owner. They
+add real independence from the author's context; they do not replace the user's own sign-off.
+
+### Reviewer A: Sprint 4 (AdamW, FlopCounter/C9, train.py). Verdict: ACCEPT WITH NOTES
+
+- AdamW matches an independent 60-digit Decimal reference (6 random shapes x 7 steps, decay and
+  no-decay keys, gradients at three scales): worst difference **4.4e-16**. Tied `wte.W`: one (m, v)
+  pair, updated once per step (moved ~0.01 at lr 1e-2, a double update would move ~0.02);
+  `lm_head.W` never appears in optimizer state.
+- Decay groups: 12 keys / 98,304 elements decay; 24 keys do not (embeddings, all biases, all LayerNorm).
+- C9: the reviewer rewrote every `@` in `nanogpt/*.py` into its own counter and hand-counted from the
+  model code. Equal to `measure_train_flops` **to the integer** at five configs (including L=4,T=128
+  and an attention-heavy d=16). Ratios to 2N+4LTd: 0.8591 to 0.9754, all inside +-25%. AST scan:
+  exactly one `@` in production (`ops.py`, inside `ops.matmul`); no dot/einsum/tensordot/inner/outer.
+- train.py: bit-identical reruns, `get_batch` windows in range and shifted by exactly 1, NaN loss
+  raises, no test asserts a falling loss.
+- **17 mutants applied; 4 survived** (a real suite gap): `train()` ignoring `lr`, ignoring `betas`,
+  forcing `weight_decay=0`, and the batch RNG using `seed` instead of `seed+1`. So `--lr` and
+  `--weight-decay` could have silently done nothing. **Fixed** (`4e68e8b`): spy tests on the AdamW
+  constructor plus behavioural tests; all four mutants re-applied by me and now killed.
+- Not fixed, recorded: the chokepoint guard does not catch `@=`, `np.outer`, `np.linalg.multi_dot` or
+  `from numpy import dot` (production is clean today); one C9 test pins prototype ratios rather than
+  only the spec band.
+
+### Reviewer B: Sprints 5 and 6 and the chat UI. Verdict: ACCEPT WITH NOTES
+
+- **C8 re-verified with the reviewer's own harness** on six configs (L 1..4, d 16..128, H 1..8, T 5..128,
+  B 1 and 3, prefill 0/1/mid/T) with realistically large random weights and random LayerNorm affines:
+  differences 7e-15 to 1.8e-11. Cache buffers filled with NaN / 1e300 / inf did not change the result,
+  so nothing reads past `cache.length`; params not mutated; step T+1 raises.
+- **Honest finding on C8's margin:** at very large weights (logits ~65, L=4, d=128, T=128) differences
+  reached **2.3e-10, over the 1e-10 bound**. The reviewer showed this is floating-point roundoff, not a
+  cache bug: a 1-ulp change to one parameter moves the plain full forward's logits by 1.3e-10 to
+  4.6e-10 with no cache involved. At the trained model's logit scale the differences are 1e-15 to 3e-13.
+  Recorded as a README caveat; no code change.
+- **Circularity:** `forward_step` is a T=1 copy sharing Linear/LayerNorm/MLP/softmax/mask_fn/scale with
+  `forward`. C8 can detect position, cache indexing, layer routing, advance and final-LN wiring errors;
+  it **cannot** detect a wrong scale, head split, softmax or mask definition shared by both paths (the
+  mask row is all-True under the causal mask). Those rest on the Sprint 1-3 oracles and gradchecks.
+- Training path untouched: `838b9c5..HEAD` on attention/block/model is +49/+10/+42 lines, 0 deletions.
+- Sampling vs an independent reference (300 rows incl. ties; 200k-draw chi-square 0.5 to 11.8 with
+  3-10 dof). Checkpoint resume-equivalence bit-identical on the reviewer's own 7+1 step loop. Object
+  arrays refused. Server: bound to loopback, 18+3 path-traversal forms all 404, 8 and 20 concurrent
+  requests correct, mid-stream disconnects survived, 20 stalled clients did not block others.
+- Phase 6: logits ~973, 1e5 and 8e6 give finite loss/grads matching an independent log-sum-exp; naive
+  softmax gives NaN on the same logits; the stability tests fail when the max-subtraction is removed.
+- ~70 mutants. **Real defects found and FIXED (`c00df5b`)**, each now covered by a test that I also
+  verified fails against the original bug:
+  1. `serve.py`: `NaN` / `Infinity` / `1e999` in `max_new`/`top_k`/`seed` raised an uncaught
+     `ValueError`/`OverflowError` and dropped the connection. Now **400**.
+  2. `checkpoint.load` without optimizer state never checked parameter shapes, so a malformed file loaded
+     and ran on broadcast garbage; dtype was silently coerced and NaN params / negative `opt_t` accepted.
+     Now shape, float64 dtype, finiteness and `opt_t >= 0` are enforced for params **and** optimizer state;
+     empty/truncated files raise `ValueError`.
+  3. `sampling`: NaN / +inf / all `-inf` rows silently returned token 0; a tiny temperature overflowed to
+     a run of blank characters with exit code 0. Now `ValueError`.
+  4. `generate.py` / `serve.py`: a missing or corrupt checkpoint was a raw traceback. Now a clean error
+     (exit 2 for the CLI).
+  5. `serve.py`: any web page could trigger CPU-burning generation (no content-type or Host check).
+     Now POST requires `application/json` (415 otherwise; this forces a CORS preflight the server never
+     answers) and, when bound to loopback, only loopback `Host` names are served (403; DNS-rebinding guard).
+  6. Connection-abort tracebacks on stderr when a client left before the reply: swallowed.
+- **Suite gaps found and FIXED:** the cached-path fixture left every LayerNorm at gamma=1, beta=0, so
+  `ln1`/`ln2`/`ln_f` were interchangeable and a cached block using the wrong one **survived the whole
+  suite** (now randomised, and the mutant dies); `sample` with `cdf < u` survived because the u=0 test's
+  lowest allowed id was 0 (new case with id 0 masked); the arbitrary-file-serving mutant survived because
+  no test probed a path that exists on disk (10 existing paths now probed); the oversized-body test was
+  masked by the prompt-length check and was **flaky on Windows** (WinError 10053): replaced by a
+  headers-only, deterministic test.
+- **Surviving by design:** removing the generation lock in `serve.py` is not detected. It is functionally
+  harmless (each request owns its `KVCache` and the parameters are read-only), so it is recorded as an
+  equivalent mutant, not hidden; a concurrency test now checks 8 simultaneous requests equal their
+  sequential results and that the lock is released.
+
+### Not verified by either reviewer
+
+The browser rendering of `web/index.html` (read only; user text goes through `esc()` and tokens through
+`textContent`); Linux/macOS; gradient correctness at 1e5 logits independent of the model's own backward
+(only finiteness and the loss value were checked); the 30-minute budget (measured separately: 841 s).
+
+### Status after the reviews
+
+Suite: **790 passed** (scratch-tree run, 40 s). The real `model.ckpt` still loads under the stricter
+validation and the restarted UI serves it; NaN bodies get 400 and `text/plain` gets 415.
+
+**Still open: TL-24 (does `wpe.W` get weight decay?) is a product decision for the project owner, not a
+defect.** Reviewer A measured it neutrally on the tiny config over 200 steps: decaying `wpe.W` changes
+final loss by +0.003 (lr 1e-3) or -0.002 (lr 1e-2); decaying `wpe.W` and `wte.W` by +0.003 or +0.024.
+Both readings are legal under the spec. The cited PM T0 / PO P0 ruling that `wte.W` has no decay comes from
+the original Sprint 4 planning drafts, which are **not in the repository**, so it cannot be verified
+from files.
