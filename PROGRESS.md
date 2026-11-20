@@ -645,9 +645,9 @@ phases.
 
 ---
 
-## Phase 4 — Optimizer, FLOP Accounting & Training Loop  [DONE 2026-11-20]
+## Phase 4 â€” Optimizer, FLOP Accounting & Training Loop  [DONE 2026-11-20]
 
-**Process:** same rules as Sprints 2–3 (per-role env-var identities, explicit pathspecs, no history
+**Process:** same rules as Sprints 2â€“3 (per-role env-var identities, explicit pathspecs, no history
 rewrites, P0 per-commit isolation gate). Sprint 3 sign-off `dfbd373` is an ancestor of HEAD. See
 **Deviations** below: this sprint's orchestration died mid-Build and was finished by a single agent.
 
@@ -660,7 +660,7 @@ rewrites, P0 per-commit isolation gate). Sprint 3 sign-off `dfbd373` is an ances
 | Engineer C | `e4babc8` [C1] batching; `04cec1b` [C2] loop + CLI; `0e351c9` [C3] loop invariants | `train.py`, `tests/test_train.py` |
 | Tech Lead | `7d16bb6` kickoff plan; Sprint 4 sign-off commit (this entry) | `SPRINT_4_PLAN.md`, `PROGRESS.md` |
 
-§9 order holds: `A1<A2<A3`, `A2<C2`, `C1<C2<C3`, `B1<B2<B3`. One milestone per commit.
+Â§9 order holds: `A1<A2<A3`, `A2<C2`, `C1<C2<C3`, `B1<B2<B3`. One milestone per commit.
 
 ### Per-commit isolation (P0 gate; TL re-run, `git archive -o` + `tar -xf` into a fresh dir, full suite)
 
@@ -705,7 +705,7 @@ a 14-minute training run was competing for the CPU. That was contention, not a t
 - **No test asserts that a loss decreased**, and `test_train.py` enforces this with an AST guard
   (itself test-the-tested on synthetic sources).
 
-### C9 — FLOPs per token (instrumented counter at the single `ops.matmul` chokepoint, TL-27)
+### C9 â€” FLOPs per token (instrumented counter at the single `ops.matmul` chokepoint, TL-27)
 
 TL re-measured on its own seed (B=2), five configs. Counts equal the exact matmul inventory
 (24Ld^2 + 2Vd dense, 4LTd attention) **to the integer**; backward = 2x forward exactly; train/fwd
@@ -731,7 +731,7 @@ outside the counter gives train/tok ~ fwd/tok (ratio ~0.32) and fails the traini
 **One real training step under `FlopCounter`** (B=16, default config) equals the exact inventory,
 and `AdamW.step` adds **0** matmuls. The TL-27 subclass counter was not re-implemented (AST-checked).
 
-### Chokepoint refactor (B1) — regression proof
+### Chokepoint refactor (B1) â€” regression proof
 
 12 production `@` sites became `ops.matmul(...)`. Bit-identical results: the 363 pre-existing tests
 passed unmodified at `bbf5863` (437 total with the new B1 tests). A new AST guard fails on any bare
@@ -739,7 +739,7 @@ passed unmodified at `bbf5863` (437 total with the new B1 tests). A new AST guar
 `from nanogpt.ops import matmul`; it is itself tested on synthetic sources. `attention_reference.py`
 is excluded.
 
-### Real training run (TL, outside pytest) — C-budget check
+### Real training run (TL, outside pytest) â€” C-budget check
 
 `python -u train.py` at the defaults (`ModelConfig(V=55, T=64, d=64, L=2, H=4)`, N = 107,712,
 batch 16, lr 1e-3 constant, wd 0.1, betas (0.9, 0.99), 4000 steps, seed 1337, synthetic corpus
@@ -762,7 +762,7 @@ C=train; R27 no LR schedule / val split / README edit. TL-24 decay groups, TL-25
 in-place updates, TL-26 `t` starts at 1, TL-27 chokepoint, TL-28/29 FLOP counting + exact
 inventory, TL-30 C9 configs, TL-31 `train.py` contract and budget.
 
-**FOR PO RATIFICATION (unratified): TL-24 — `wpe.W` is excluded from weight decay.** The spec says
+**FOR PO RATIFICATION (unratified): TL-24 â€” `wpe.W` is excluded from weight decay.** The spec says
 "weight matrices". We read that as the linear maps (minGPT convention). Karpathy's nanoGPT decays
 every >= 2-D tensor including embeddings, so this is a genuine reading choice. The decision is a
 one-line change to `NO_DECAY_PATTERNS`, covered by `test_decay_groups_match_param_keys_exactly`.
@@ -807,13 +807,13 @@ save/load, sampling or generation. Corpus SHA-256 still `7afc055a...2854`, V = 5
   are covered by discipline and by their own AST guards, not by that scan.
 - Suite runtime: 516 tests ~20-25 s. Budget 60 s.
 
-**Next: Phase 5 — Generation (Sprint 5).** `kv_cache.py`, `sampling.py`, `checkpoint.py`,
+**Next: Phase 5 â€” Generation (Sprint 5).** `kv_cache.py`, `sampling.py`, `checkpoint.py`,
 `generate.py`, and C8 (teacher-forced, length <= T, 1e-10 absolute).
 
 
 ---
 
-## Phase 5 — Generation: KV-Cache, Sampling, Checkpointing  [DONE 2026-11-20]
+## Phase 5 â€” Generation: KV-Cache, Sampling, Checkpointing  [DONE 2026-11-20]
 
 **Process:** as Sprints 3-4 (per-role env-var identities, explicit pathspecs, no history rewrites,
 P0 per-commit isolation gate). This sprint was run by a single agent directly from
@@ -832,16 +832,18 @@ Order holds: `A1<A2<A3`, `B1<B2`, `C1<C2`, `{A2,B2}<C2`. One milestone per commi
 ### Per-commit isolation (P0 gate; TL re-run via `git archive -o` + `tar -xf`, full suite)
 
 `5fc9310` 537 | `b0c1c0a` 546 | `3ffcd09` 563 | `4f9e37e` 589 | `13bb2ab` 624 | `862bc27` 641 |
-`fa248b9` 664 | `33fccd6` 665 — **all passed.** Every Sprint 5 commit is a valid bisect point, and
+`fa248b9` 664 | `33fccd6` 665 â€” **all passed.** Every Sprint 5 commit is a valid bisect point, and
 each touches only its owner's files (checked with `git show --name-only`).
 
 ### Real test status (TL run, HEAD `33fccd6`)
 
 `pytest tests/ -q`: **665 passed**, 27.7 s and 22.5 s on two consecutive runs. New files: test_kv_cache
-(45 tests, ~0.6 s), test_sampling (88 incl. both sections, ~0.4 s), test_checkpoint (~1.3 s),
-test_generate (23, ~1.4 s). All files < 10 s; whole suite well under 60 s.
+(45 tests, ~0.6 s), test_sampling (59, ~0.3 s), test_checkpoint (15, ~1.1 s),
+test_generate (23, ~1.2 s). The Sprint 4 chokepoint guard in `test_flops.py` (now 83 tests) parametrizes over
+`nanogpt/*.py`, so it scanned the three new modules automatically and found no bare `@`.
+All files < 10 s; whole suite well under 60 s.
 
-### C8 — KV-cache equivalence (TL independent re-measurement, own seed, own full-forward reference)
+### C8 â€” KV-cache equivalence (TL independent re-measurement, own seed, own full-forward reference)
 
 Teacher-forced on a fixed sequence of length exactly `cfg.T` (the boundary of the "length <= T"
 precondition), batch 2, perturbed (non-trivial) weights, three prefill/decode splits each. Gate is
@@ -857,7 +859,7 @@ A cached-vs-prefix check also confirms logits at position i equal the full forwa
 prefix `[0..i]`: later tokens cannot influence them.
 
 **Test-the-tests (each caught):** shifted mask => cached and full **disagree** (3.08 max abs; the
-full path leaks one future token that the cache structurally cannot see — C8's 1e-10 claim is made
+full path leaks one future token that the cache structurally cannot see â€” C8's 1e-10 claim is made
 for `causal_mask` only, TL-34); stale cache (advance never bumps `length`) => diverges; wrong
 position embedding (`pos+1`) => diverges; feeding a different teacher-forced token changes every
 later logit. **Honest record:** a cached path that *ignores* its mask row is bit-identical under
@@ -871,7 +873,7 @@ Per-step cached matmul FLOPs equal the hand-derived closed form `24Ld^2 + 2Vd + 
 integer** at every position, both configs. Generating 32 tokens after a 32-token prompt at the
 default config: **7.3M FLOPs cached vs 356.0M recomputing the full forward each step = 48.7x fewer.**
 
-### Training path untouched (TL-32) — regression proof
+### Training path untouched (TL-32) â€” regression proof
 
 `git diff --numstat 838b9c5..HEAD`: `attention.py` +49/-0, `block.py` +10/-0, `model.py` +42/-0.
 Only new methods (`forward_step`, `prefill`) were added; `forward`, `backward`, `embed`,
@@ -940,4 +942,4 @@ case was removed, and two tests were added. Shipped as `TL fixup` `33fccd6`.
   diagonal is always allowed), but a future mask change could.
 - Suite ~22-28 s of the 60 s budget.
 
-**Next: Phase 6 — Numerical stability (large-logit, full model), then Phase 8 wrap-up.**
+**Next: Phase 6 â€” Numerical stability (large-logit, full model), then Phase 8 wrap-up.**
