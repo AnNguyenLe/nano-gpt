@@ -809,3 +809,135 @@ save/load, sampling or generation. Corpus SHA-256 still `7afc055a...2854`, V = 5
 
 **Next: Phase 5 — Generation (Sprint 5).** `kv_cache.py`, `sampling.py`, `checkpoint.py`,
 `generate.py`, and C8 (teacher-forced, length <= T, 1e-10 absolute).
+
+
+---
+
+## Phase 5 — Generation: KV-Cache, Sampling, Checkpointing  [DONE 2026-11-20]
+
+**Process:** as Sprints 3-4 (per-role env-var identities, explicit pathspecs, no history rewrites,
+P0 per-commit isolation gate). This sprint was run by a single agent directly from
+`SPRINT_5_PLAN.md` (no Workflow orchestration, no PO pass); see Deviations. Sprint 4 sign-off
+`8eb0b17` is an ancestor of HEAD.
+
+| Role | Commits | Files |
+|---|---|---|
+| Engineer A | `5fc9310` [A1] KVCache; `b0c1c0a` [A2] cached forward; `3ffcd09` [A3] C8 + adversaries + FLOP closed form | `nanogpt/kv_cache.py`, `tests/test_kv_cache.py`; A2 also `attention.py`, `block.py`, `model.py` (**additions only**) |
+| Engineer B | `4f9e37e` [B1] temperature + greedy; `13bb2ab` [B2] top-k + sample + 4 bug variants | `nanogpt/sampling.py`, `tests/test_sampling.py` |
+| Engineer C | `862bc27` [C1] checkpoint; `fa248b9` [C2] generate.py | `nanogpt/checkpoint.py`, `generate.py`, `tests/test_checkpoint.py`, `tests/test_generate.py` |
+| Tech Lead | `838b9c5` kickoff plan; `33fccd6` TL fixup (TL-40); sign-off commit (this entry) | `SPRINT_5_PLAN.md`, `train.py`, `tests/test_train.py`, `PROGRESS.md` |
+
+Order holds: `A1<A2<A3`, `B1<B2`, `C1<C2`, `{A2,B2}<C2`. One milestone per commit.
+
+### Per-commit isolation (P0 gate; TL re-run via `git archive -o` + `tar -xf`, full suite)
+
+`5fc9310` 537 | `b0c1c0a` 546 | `3ffcd09` 563 | `4f9e37e` 589 | `13bb2ab` 624 | `862bc27` 641 |
+`fa248b9` 664 | `33fccd6` 665 — **all passed.** Every Sprint 5 commit is a valid bisect point, and
+each touches only its owner's files (checked with `git show --name-only`).
+
+### Real test status (TL run, HEAD `33fccd6`)
+
+`pytest tests/ -q`: **665 passed**, 27.7 s and 22.5 s on two consecutive runs. New files: test_kv_cache
+(45 tests, ~0.6 s), test_sampling (88 incl. both sections, ~0.4 s), test_checkpoint (~1.3 s),
+test_generate (23, ~1.4 s). All files < 10 s; whole suite well under 60 s.
+
+### C8 — KV-cache equivalence (TL independent re-measurement, own seed, own full-forward reference)
+
+Teacher-forced on a fixed sequence of length exactly `cfg.T` (the boundary of the "length <= T"
+precondition), batch 2, perturbed (non-trivial) weights, three prefill/decode splits each. Gate is
+**absolute**, 1e-10 (`KV_CACHE_ABS_TOL`):
+
+| Config | worst max abs diff | logit scale |
+|---|---|---|
+| tiny d=8 T=4 | 8.9e-16 | 2.6 |
+| default d=64 T=64 | 3.3e-14 | 8.6 |
+| max d=128 T=128 L=4 | 2.6e-13 | 13.6 |
+
+A cached-vs-prefix check also confirms logits at position i equal the full forward of just the
+prefix `[0..i]`: later tokens cannot influence them.
+
+**Test-the-tests (each caught):** shifted mask => cached and full **disagree** (3.08 max abs; the
+full path leaks one future token that the cache structurally cannot see — C8's 1e-10 claim is made
+for `causal_mask` only, TL-34); stale cache (advance never bumps `length`) => diverges; wrong
+position embedding (`pos+1`) => diverges; feeding a different teacher-forced token changes every
+later logit. **Honest record:** a cached path that *ignores* its mask row is bit-identical under
+`causal_mask`, so C8 **cannot** detect it today. TL-33 (honour `mask_fn`) is therefore a robustness
+ruling, not a discriminated one; a test shows the converse (a restrictive mask row does change
+logits) so the hook is not dead code.
+
+### Cache cost (instrumented, Sprint 4's `FlopCounter`)
+
+Per-step cached matmul FLOPs equal the hand-derived closed form `24Ld^2 + 2Vd + 4Ld(pos+1)` **to the
+integer** at every position, both configs. Generating 32 tokens after a 32-token prompt at the
+default config: **7.3M FLOPs cached vs 356.0M recomputing the full forward each step = 48.7x fewer.**
+
+### Training path untouched (TL-32) — regression proof
+
+`git diff --numstat 838b9c5..HEAD`: `attention.py` +49/-0, `block.py` +10/-0, `model.py` +42/-0.
+Only new methods (`forward_step`, `prefill`) were added; `forward`, `backward`, `embed`,
+`forward_from_embedding`, `forward_loss`, `backward_loss` are byte-identical. No Sprint 1-3 test
+file changed. The only edited pre-existing test file is `tests/test_train.py` (see TL-40 below).
+Consequently **C5, C6, C7 and C9 stay signed off by the unmodified suite**, which passes.
+**TL-9 reconfirmed on HEAD** for each block's `attn.k.b` (tiny, perturbed params, own seed):
+(a) analytic max|g| 3.0e-18 / 6.0e-18 (<= 1e-12); (b) FD max|g| 0.0 (<= 1e-8); (c) invariance
+max|dlogits| 7.8e-16 / 6.7e-16 (<= 1e-12); (d) the dropped-term adversary is the unmodified
+`tests/test_gradients.py` case, which passes.
+
+### Sampling, checkpointing, generate
+
+- **Sampling:** closed-form anchors (temperature identity at 1.0, `log(p_a/p_b) = (a-b)/t`, monotone
+  convergence to uniform, `top_k=V` no-op, exactly k finite per row, `top_k=1` == greedy at any
+  temperature, masked probabilities exactly 0, rows sum to 1, deterministic tie-break by index, CDF
+  edge cases `u=0` and `u=1-eps`). A clearly-labelled statistical check (20k draws, 4 SE) is *not* a
+  correctness anchor. **Four buggy variants are each caught** by a shared anchor battery that the real
+  implementation passes: top-k keeps the smallest; top-k off by one; sampling from un-renormalised
+  probabilities; temperature applied as multiply. `temperature=0` raises (no silent argmax).
+- **Checkpoint:** params round-trip bit-identically; loaded keys are exactly `param_keys()`; `wte.W`
+  is one contiguous array and `named_parameters()["lm_head.W"] is params["wte.W"]`; AdamW `t`, `m`,
+  `v` and hyperparameters round-trip exactly and `restore_optimizer` shares the loaded arrays by
+  identity. **Resume equivalence** (train 3, save, load, step once == train 4 uninterrupted) is
+  **bit-identical**, TL-reproduced independently; a fresh-optimizer "resume" is shown to differ.
+  Rejected: `param/lm_head.W`, wrong/missing format, missing/extra param keys, incomplete or
+  misshapen optimizer state, and pickled object arrays (`allow_pickle=False`, AST-checked).
+- **generate.py:** deterministic per seed; cached greedy generation equals a naive loop that re-runs
+  the full non-cached forward each step; fills the window exactly and refuses `len(prompt)+tokens > T`;
+  rejects out-of-vocab prompts, bad ids/dtypes/counts, a non-empty or batch>1 cache, and a vocab
+  mismatch with a checkpoint. **No test asserts anything about the content of generated text.**
+- **End to end (TL, record only):** `train.py --steps 300 --save <ckpt>` then
+  `generate.py --checkpoint <ckpt> --prompt "the " --tokens 40 --top-k 8` runs and prints text. This
+  demonstrates the pipeline works; it is not evidence of correctness.
+
+### Rulings (TL-32..TL-40)
+
+TL-32 cached path additive (new methods, no signature changes, no backward/gradcheck); TL-33 cached
+attention uses the last row of `mask_fn(pos+1)`; TL-34 shifted mask is C8's discriminator and
+cached != full there is correct; TL-35 pre-allocated cache, strict layer order, hard capacity `T`,
+no sliding window; TL-36 absolute-position embedding read before layers append, `prefill` loops
+`forward_step`; TL-37 sampling contract; TL-38 checkpoint format (`np.savez`, `allow_pickle=False`);
+TL-39 `generate.py` contract. **TL-40 (new, recorded deviation from the plan):** `train.py` gains an
+optional `--save PATH` (calls `checkpoint.save`) so train -> generate works from the CLI. This needed
+one edit to a Sprint 4 test file (`tests/test_train.py`): the R22 scope guard now permits importing
+`checkpoint` only (kv_cache/sampling/generate/pickle/np.save remain forbidden), the matching synthetic
+case was removed, and two tests were added. Shipped as `TL fixup` `33fccd6`.
+
+### Deviations from SPRINT_5_PLAN.md
+
+- **D-S5-1 (TL-40, above).** One Sprint 4 test file edited, deliberately and disclosed, to make
+  the pipeline usable end to end. All other pre-existing tests are untouched.
+- **D-S5-2 (process, material, carried).** No PO pass for Sprint 4 *or* Sprint 5; both sprints were
+  signed off by TL re-measurement only, and Sprint 5 was implemented by one agent (commits carry role
+  identities). **TL-24 (`wpe.W` no-decay) remains unratified.** Carried to the Phase 8 final gate,
+  where the plan already reserves an independent high-effort PO pass.
+- **D-S5-3 (minor).** Two weak tests were written first in `test_generate.py` (one vacuous assertion,
+  one unused variable) and fixed before commit; no vacuous assertion was committed.
+
+### Watch items for Sprint 6
+
+- Phase 6 is the large-logit pass at **full-model** level (logits ~1e3) plus re-confirmation that T=1,
+  the shifted mask and the cached path stay green: `tests/test_numerical_stability.py` does not exist
+  yet. Stable softmax/CE already survive 1e3 logits at unit level (`test_loss.py`).
+- `softmax_forward` has no all-`-inf` row protection; the cached path never produces one (the
+  diagonal is always allowed), but a future mask change could.
+- Suite ~22-28 s of the 60 s budget.
+
+**Next: Phase 6 — Numerical stability (large-logit, full model), then Phase 8 wrap-up.**
