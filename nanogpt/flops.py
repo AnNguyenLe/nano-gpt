@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from nanogpt import ops
+from nanogpt.config import FLOPS_REL_BAND
 
 _VALID_KINDS = ("dense", "attention")
 _VALID_PHASES = ("forward", "backward")
@@ -194,3 +195,39 @@ def exact_forward_matmul_per_token(cfg) -> dict:
     """
     L, T, d, V = cfg.L, cfg.T, cfg.d, cfg.V
     return {"dense": 24 * L * d * d + 2 * V * d, "attention": 4 * L * T * d}
+
+
+# ---------------------------------------------------------------------------
+# C9: corrected FLOPs formulas, band check (B3)
+# ---------------------------------------------------------------------------
+def formula_forward_per_token(cfg) -> int:
+    """Corrected forward FLOPs/token: 2N + 4*L*T*d (N = C1 param count)."""
+    from nanogpt.param_count import formula_from_config
+
+    return 2 * formula_from_config(cfg) + 4 * cfg.L * cfg.T * cfg.d
+
+
+def formula_train_per_token(cfg) -> int:
+    """Corrected training FLOPs/token: 6N + 12*L*T*d."""
+    from nanogpt.param_count import formula_from_config
+
+    return 6 * formula_from_config(cfg) + 12 * cfg.L * cfg.T * cfg.d
+
+
+def naive_forward_per_token(cfg) -> int:
+    """Naive 2N (ignores the attention term). Test-the-test only."""
+    from nanogpt.param_count import formula_from_config
+
+    return 2 * formula_from_config(cfg)
+
+
+def naive_train_per_token(cfg) -> int:
+    """Naive 6N (ignores the attention term). Test-the-test only."""
+    from nanogpt.param_count import formula_from_config
+
+    return 6 * formula_from_config(cfg)
+
+
+def within_band(measured, predicted, band=FLOPS_REL_BAND) -> bool:
+    """|measured / predicted - 1| <= band."""
+    return abs(measured / predicted - 1.0) <= band

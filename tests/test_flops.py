@@ -517,3 +517,142 @@ def test_exact_inventory_closed_forms_at_known_configs():
         cfg, rep = _measure(name)
         assert rep.fwd_per_token == want, (name, rep.fwd_per_token)
         assert rep.train_per_token == 3 * want
+
+
+# ===========================================================================
+# [B3] C9: corrected FLOPs formula band + discriminators (TL-30)
+# ===========================================================================
+# Ratios from the TL-30 prototype table, to 4 dp (measured / corrected formula).
+TL30_FWD_RATIO = {"tiny": 0.8915, "default": 0.9526, "long": 0.9580,
+                  "max": 0.9754, "discriminator": 0.8591}
+TL30_NAIVE_RATIO = {"tiny": 0.9427, "default": 1.0974, "long": 1.2545,
+                    "max": 1.1320, "discriminator": 1.5983}
+TL30_ATTN_SHARE = {"tiny": 0.054, "default": 0.132, "long": 0.236,
+                   "max": 0.138, "discriminator": 0.463}
+C9_BAND_CONFIGS = ("tiny", "default", "long", "max")  # in-band by spec/TL-30
+
+
+def test_formula_values_match_hand_derivation():
+    cfg = C9_CONFIGS["default"]  # N = 107,712 (C1)
+    assert flops.formula_forward_per_token(cfg) == 2 * 107_712 + 4 * 2 * 64 * 64
+    assert flops.formula_train_per_token(cfg) == 6 * 107_712 + 12 * 2 * 64 * 64
+    assert flops.naive_forward_per_token(cfg) == 2 * 107_712
+    assert flops.naive_train_per_token(cfg) == 6 * 107_712
+
+
+def test_within_band_edges():
+    assert flops.within_band(100, 100)
+    assert flops.within_band(125, 100) and flops.within_band(75, 100)
+    assert not flops.within_band(126, 100) and not flops.within_band(74, 100)
+    assert flops.within_band(120, 100, band=0.2) and not flops.within_band(121, 100, band=0.2)
+
+
+@pytest.mark.parametrize("name", C9_BAND_CONFIGS)
+def test_c9_measured_flops_within_band_of_corrected_formula(name, capsys):
+    cfg, rep = _measure(name)
+    fwd_pred = flops.formula_forward_per_token(cfg)
+    train_pred = flops.formula_train_per_token(cfg)
+    fwd_ratio = rep.fwd_per_token / fwd_pred
+    train_ratio = rep.train_per_token / train_pred
+    print(f"C9 {name}: fwd/tok={rep.fwd_per_token:.0f} corrected={fwd_pred} "
+          f"ratio={fwd_ratio:.4f} train/tok={rep.train_per_token:.0f} "
+          f"ratio={train_ratio:.4f} attn_share(measured)={rep.attn_share_fwd:.3f}")
+    assert flops.within_band(rep.fwd_per_token, fwd_pred)
+    assert flops.within_band(rep.train_per_token, train_pred)
+    # training is exactly 3x forward in measurement AND in the formula
+    assert train_ratio == pytest.approx(fwd_ratio, rel=0, abs=1e-12)
+    assert round(fwd_ratio, 4) == TL30_FWD_RATIO[name]
+
+
+def test_c9_discriminator_config_also_measured_and_reported():
+    cfg, rep = _measure("discriminator")
+    ratio = rep.fwd_per_token / flops.formula_forward_per_token(cfg)
+    assert round(ratio, 4) == TL30_FWD_RATIO["discriminator"]
+
+
+@pytest.mark.parametrize("name", list(C9_CONFIGS))
+def test_attention_share_interpretation(name):
+    cfg, rep = _measure(name)
+    inv = flops.exact_forward_matmul_per_token(cfg)
+    assert rep.attn_share_fwd == pytest.approx(
+        inv["attention"] / (inv["dense"] + inv["attention"]))
+    # share of the corrected total, per TL-30: 4LTd / (2N + 4LTd)
+    formula_share = 4 * cfg.L * cfg.T * cfg.d / flops.formula_forward_per_token(cfg)
+    assert round(formula_share, 3) == TL30_ATTN_SHARE[name]
+    if name in ("default", "max"):
+        assert 0.13 <= formula_share <= 0.20  # spec's 13-20% attention term
+
+
+def test_naive_formula_fails_band_at_long_and_discriminator():
+    for name in ("long", "discriminator"):
+        cfg, rep = _measure(name)
+        assert round(rep.fwd_per_token / flops.naive_forward_per_token(cfg), 4) == TL30_NAIVE_RATIO[name]
+        assert not flops.within_band(rep.fwd_per_token, flops.naive_forward_per_token(cfg))
+        assert not flops.within_band(rep.train_per_token, flops.naive_train_per_token(cfg))
+        # ...while the corrected formula does pass on the in-range long config
+    cfg, rep = _measure("long")
+    assert flops.within_band(rep.fwd_per_token, flops.formula_forward_per_token(cfg))
+
+
+def test_naive_formula_passes_band_at_default_so_band_alone_does_not_discriminate():
+    # Documented on purpose: nobody may claim the +-25% band by itself proves
+    # the attention term. C9 discriminates only via (a) the integer-exact
+    # inventory and (b) the attention-heavy configs above.
+    cfg, rep = _measure("default")
+    assert flops.within_band(rep.fwd_per_token, flops.naive_forward_per_token(cfg))
+    assert round(rep.fwd_per_token / flops.naive_forward_per_token(cfg), 4) == TL30_NAIVE_RATIO["default"]
+
+
+def _measure_attention_blind(cfg):
+    """Test-local counter variant that IGNORES kind='attention' calls."""
+    model = GPT(cfg)
+    params = model.init_params(make_rng(_B_SEED))
+    rng = make_rng(_B_SEED + 1)
+    idx = rng.integers(0, cfg.V, size=(1, cfg.T))
+    tgt = rng.integers(0, cfg.V, size=(1, cfg.T))
+    orig = ops.matmul
+    tally = {"fwd": 0}
+
+    def blind(a, b, *, kind="dense"):
+        if kind == "dense":
+            tally["fwd"] += flops.matmul_flops(np.shape(a), np.shape(b))
+        return orig(a, b, kind=kind)
+
+    ops.matmul = blind
+    try:
+        model.forward_loss(idx, tgt, params)
+    finally:
+        ops.matmul = orig
+    return tally["fwd"] / idx.size
+
+
+def test_attention_blind_counter_fails_exact_inventory_and_discriminator_band():
+    cfg = C9_CONFIGS["discriminator"]
+    blind = _measure_attention_blind(cfg)
+    inv = flops.exact_forward_matmul_per_token(cfg)
+    assert blind != inv["dense"] + inv["attention"]
+    assert not flops.within_band(blind, flops.formula_forward_per_token(cfg))
+
+
+def test_backward_outside_counter_fails_the_training_band():
+    for name in ("default", "long", "max"):
+        cfg, rep = _measure(name)
+        fwd_only = flops.FlopReport(tokens=rep.tokens, fwd_dense=rep.fwd_dense,
+                                    fwd_attn=rep.fwd_attn, bwd_dense=0, bwd_attn=0)
+        assert fwd_only.train_per_token == fwd_only.fwd_per_token
+        assert not flops.within_band(fwd_only.train_per_token,
+                                     flops.formula_train_per_token(cfg))
+        ratio = fwd_only.train_per_token / flops.formula_train_per_token(cfg)
+        assert 0.30 < ratio < 0.35  # about 0.32, i.e. 1/3 of the full training work
+
+
+def test_subclass_counter_approach_is_not_reimplemented():
+    # TL-27: the ndarray-subclass counter is unsound (np.asarray strips it).
+    # The module may mention it in prose, but must not define it in code.
+    tree = ast.parse((NANOGPT_DIR / "flops.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                assert not (isinstance(base, ast.Attribute) and base.attr == "ndarray"), node.name
+        if isinstance(node, ast.FunctionDef):
+            assert node.name != "__array_ufunc__"
